@@ -32,12 +32,11 @@ pub use crate::sys::app::{AppInfo, WindowInfo, pid_t};
 use crate::sys::axuielement::{
     AX_STANDARD_WINDOW_SUBROLE, AX_WINDOW_ROLE, AXUIElement, Error as AxError,
 };
-use crate::sys::enhanced_ui::{with_enhanced_ui_disabled, with_system_enhanced_ui_disabled};
+use crate::sys::enhanced_ui::with_enhanced_ui_disabled;
 use crate::sys::event;
 use crate::sys::executor::Executor;
 use crate::sys::observer::Observer;
 use crate::sys::process::ProcessInfo;
-use crate::sys::skylight::{G_CONNECTION, SLSDisableUpdate, SLSReenableUpdate};
 use crate::sys::window_server::{self, WindowServerId, WindowServerInfo};
 
 const kAXApplicationActivatedNotification: &str = "AXApplicationActivated";
@@ -196,10 +195,8 @@ impl Debug for AppThreadHandle {
 #[derive(Debug)]
 pub enum Request {
     Terminate,
-    GetVisibleWindows {
-        force_refresh: bool,
-    },
-    MarkWindowsNeedingInfo(Vec<WindowId>),
+    GetVisibleWindows,
+    WindowMaybeDestroyed(WindowId),
     CloseWindow(WindowId),
 
     SetWindowFrame(WindowId, CGRect, TransactionId, bool),
@@ -246,8 +243,7 @@ struct State {
     app: AXUIElement,
     observer: Observer,
     events_tx: reactor::Sender,
-    windows: HashMap<WindowId, WindowState>,
-    needs_resync: HashSet<WindowId>,
+    windows: HashMap<WindowId, AppWindowState>,
     last_window_idx: u32,
     main_window: Option<WindowId>,
     last_activated: Option<(Instant, Quiet, Option<WindowId>, r#continue::Sender<()>)>,
@@ -257,11 +253,12 @@ struct State {
     tx_store: Option<WindowTxStore>,
 }
 
-struct WindowState {
+struct AppWindowState {
     pub elem: AXUIElement,
     last_seen_txid: TransactionId,
     hidden_by_app: bool,
     window_server_id: Option<WindowServerId>,
+    is_animating: bool,
 }
 
 const APP_NOTIFICATIONS: &[&str] = &[
@@ -273,6 +270,7 @@ const APP_NOTIFICATIONS: &[&str] = &[
     kAXWindowCreatedNotification,
     kAXMenuOpenedNotification,
     kAXMenuClosedNotification,
+    kAXTitleChangedNotification,
 ];
 
 const WINDOW_NOTIFICATIONS: &[&str] = &[
@@ -281,10 +279,9 @@ const WINDOW_NOTIFICATIONS: &[&str] = &[
     kAXWindowResizedNotification,
     kAXWindowMiniaturizedNotification,
     kAXWindowDeminiaturizedNotification,
-    kAXTitleChangedNotification,
 ];
 
-const WINDOW_ANIMATION_NOTIFICATIONS: &[&str] = //&[];
+const WINDOW_ANIMATION_NOTIFICATIONS: &[&str] =
     &[kAXWindowMovedNotification, kAXWindowResizedNotification];
 
 impl State {
@@ -294,7 +291,7 @@ impl State {
         store.get(&wsid).map(|record| record.txid)
     }
 
-    fn txid_for_window_state(&self, window: &WindowState) -> Option<TransactionId> {
+    fn txid_for_window_state(&self, window: &AppWindowState) -> Option<TransactionId> {
         self.txid_from_store(window.window_server_id)
             .or_else(|| Self::some_txid(window.last_seen_txid))
     }
@@ -452,12 +449,21 @@ impl State {
                 self.send_event(Event::ApplicationThreadTerminated(self.pid));
                 return Ok(true);
             }
-            Request::MarkWindowsNeedingInfo(wids) => {
-                for wid in wids.iter().copied() {
-                    if wid.pid == self.pid && self.windows.contains_key(&wid) {
-                        self.needs_resync.insert(wid);
-                    }
+            Request::WindowMaybeDestroyed(wid) => {
+                let wid = *wid;
+                if wid.pid != self.pid {
+                    return Ok(false);
                 }
+
+                // If we don't know this window, nothing to verify.
+                if !self.windows.contains_key(&wid) {
+                    return Ok(false);
+                }
+
+                // Trigger a visible windows refresh. If the window is gone, the reactor
+                // will detect it via missing membership and tear down state.
+                *request = Request::GetVisibleWindows;
+                return self.handle_request(request);
             }
             Request::CloseWindow(wid) => {
                 if let Some(window) = self.windows.get(wid)
@@ -466,7 +472,7 @@ impl State {
                     warn!(?wid, error = ?err, "Failed to close window");
                 }
             }
-            Request::GetVisibleWindows { force_refresh } => {
+            Request::GetVisibleWindows => {
                 let window_elems = match self.app.windows() {
                     Ok(elems) => elems,
                     Err(e) => {
@@ -484,22 +490,16 @@ impl State {
                     let elem = elem.clone();
                     if let Ok(id) = self.id(&elem) {
                         known_visible.push(id);
-                        let needs_refresh = *force_refresh || self.needs_resync.contains(&id);
-                        if needs_refresh {
-                            match WindowInfo::from_ax_element(&elem, None) {
-                                Ok((info, _)) => {
-                                    if info.sys_id.is_some() {
-                                        self.needs_resync.remove(&id);
-                                    }
-                                    new.push((id, info));
-                                }
-                                Err(err) => {
-                                    trace!(
-                                        ?id,
-                                        ?err,
-                                        "Failed to refresh window info; will retry later"
-                                    );
-                                }
+                        match WindowInfo::from_ax_element(&elem, None) {
+                            Ok((info, _)) => {
+                                new.push((id, info));
+                            }
+                            Err(err) => {
+                                trace!(
+                                    ?id,
+                                    ?err,
+                                    "Failed to refresh window info; will retry later"
+                                );
                             }
                         }
                         continue;
@@ -507,18 +507,7 @@ impl State {
                     let Some((info, wid, _)) = self.register_window(elem, None) else {
                         continue;
                     };
-                    self.needs_resync.remove(&wid);
                     new.push((wid, info));
-                }
-                if !*force_refresh {
-                    for wid in self.needs_resync.iter().copied() {
-                        if wid.pid == self.pid
-                            && self.windows.contains_key(&wid)
-                            && !known_visible.contains(&wid)
-                        {
-                            known_visible.push(wid);
-                        }
-                    }
                 }
                 self.send_event(Event::WindowsDiscovered {
                     pid: self.pid,
@@ -583,7 +572,7 @@ impl State {
                 };
 
                 if eui {
-                    with_enhanced_ui_disabled(&elem, || {
+                    with_enhanced_ui_disabled(&self.app, || {
                         let _ = elem.set_size(desired.size);
                         let _ = elem.set_position(desired.origin);
                         let _ = elem.set_size(desired.size);
@@ -609,8 +598,8 @@ impl State {
                 ));
             }
             &mut Request::SetBatchWindowFrame(ref mut frames, txid) => {
-                unsafe { SLSDisableUpdate(*G_CONNECTION) };
-                let result = with_system_enhanced_ui_disabled(|| -> Result<(), AxError> {
+                let app = self.app.clone();
+                let result = with_enhanced_ui_disabled(&app, || -> Result<(), AxError> {
                     for (wid, desired) in frames.iter() {
                         let elem = match self.window_mut(*wid) {
                             Ok(window) => {
@@ -647,14 +636,14 @@ impl State {
                     }
                     Ok(())
                 });
-                unsafe { SLSReenableUpdate(*G_CONNECTION) };
                 if let Err(err) = result {
                     return Err(err);
                 }
             }
             &mut Request::BeginWindowAnimation(wid) => {
-                let window = self.window(wid)?;
-                self.stop_notifications_for_animation(&window.elem);
+                let window = self.window_mut(wid)?;
+                window.is_animating = true;
+                self.stop_notifications_for_animation(&self.window(wid)?.elem);
             }
             &mut Request::EndWindowAnimation(wid) => {
                 let (elem, txid) = match self.window(wid) {
@@ -669,6 +658,9 @@ impl State {
                         AxError::NotFound => return Ok(false),
                     },
                 };
+                if let Ok(window) = self.window_mut(wid) {
+                    window.is_animating = false;
+                }
                 self.restart_notifications_after_animation(&elem);
                 let frame =
                     match self.handle_ax_result(wid, trace("frame", &elem, || elem.frame()))? {
@@ -702,7 +694,11 @@ impl State {
                 _ = self.on_activation_changed();
             }
             kAXMainWindowChangedNotification => {
-                self.on_main_window_changed(None);
+                // NOTE(acsandmann):
+                // because of apps like firefox that send delayed(or dont send at all) axuielementdestroyed/windowserverdisappeared
+                // this is a fallback to ensure we handle windows being closed
+                self.remove_stale_windows();
+                self.on_main_window_changed(None, false);
             }
             kAXWindowCreatedNotification => {
                 if self.id(&elem).is_ok() {
@@ -728,15 +724,21 @@ impl State {
                     return;
                 };
                 self.windows.remove(&wid);
-                self.needs_resync.remove(&wid);
                 self.send_event(Event::WindowDestroyed(wid));
 
-                self.on_main_window_changed(Some(wid));
+                self.on_main_window_changed(Some(wid), false);
             }
             kAXWindowMovedNotification | kAXWindowResizedNotification => {
                 let Ok(wid) = self.id(&elem) else {
                     return;
                 };
+
+                if let Ok(window) = self.window(wid) {
+                    if window.is_animating {
+                        trace!(?wid, ?notif, "Ignoring notification during animation");
+                        return;
+                    }
+                }
                 let txid = match self.window(wid) {
                     Ok(window) => self.txid_for_window_state(window),
                     Err(err) => {
@@ -922,7 +924,7 @@ impl State {
             };
 
             if is_last {
-                let main_window = this.on_main_window_changed(quiet_if);
+                let main_window = this.on_main_window_changed(quiet_if, true);
                 if main_window != Some(wid) {
                     warn!(
                         "Raise request failed to raise {desired:?}; instead got main_window={main_window:?}",
@@ -935,7 +937,11 @@ impl State {
         Ok(())
     }
 
-    fn on_main_window_changed(&mut self, quiet_if: Option<WindowId>) -> Option<WindowId> {
+    fn on_main_window_changed(
+        &mut self,
+        quiet_if: Option<WindowId>,
+        allow_register: bool,
+    ) -> Option<WindowId> {
         let elem = match trace("main_window", &self.app, || self.app.main_window()) {
             Ok(elem) => elem,
             Err(e) => {
@@ -951,6 +957,17 @@ impl State {
         let wid = match self.id(&elem).ok() {
             Some(wid) => wid,
             None => {
+                if !allow_register {
+                    warn!(?self.pid, "Got MainWindowChanged on unknown window; clearing main window");
+                    if self.main_window.take().is_some() {
+                        self.send_event(Event::ApplicationMainWindowChanged(
+                            self.pid,
+                            None,
+                            Quiet::No,
+                        ));
+                    }
+                    return None;
+                }
                 let Some((info, wid, window_server_info)) = self.register_window(elem, None) else {
                     warn!(?self.pid, "Got MainWindowChanged on unknown window");
                     return None;
@@ -1008,7 +1025,7 @@ impl State {
                 }
             };
 
-            self.on_main_window_changed(quiet_window_change);
+            self.on_main_window_changed(quiet_window_change, true);
 
             Event::ApplicationActivated(self.pid, quiet_activation)
         };
@@ -1062,7 +1079,6 @@ impl State {
                 continue;
             }
             let wid = *wid;
-            self.needs_resync.insert(wid);
             to_restore.push(wid);
         }
 
@@ -1149,11 +1165,12 @@ impl State {
         let hidden_by_app = self.is_hidden;
         let last_seen_txid = self.txid_from_store(window_server_id).unwrap_or_default();
 
-        let old = self.windows.insert(wid, WindowState {
+        let old = self.windows.insert(wid, AppWindowState {
             elem,
             last_seen_txid,
             hidden_by_app,
             window_server_id,
+            is_animating: false,
         });
         debug_assert!(old.is_none(), "Duplicate window id {wid:?}");
         if hidden_by_app {
@@ -1186,9 +1203,8 @@ impl State {
     fn handle_ax_error(&mut self, wid: WindowId, err: &AXError) -> bool {
         if matches!(*err, AXError::InvalidUIElement) {
             if self.windows.remove(&wid).is_some() {
-                self.needs_resync.remove(&wid);
                 self.send_event(Event::WindowDestroyed(wid));
-                self.on_main_window_changed(Some(wid));
+                self.on_main_window_changed(Some(wid), false);
             }
             return true;
         }
@@ -1221,14 +1237,48 @@ impl State {
         }
     }
 
+    fn remove_stale_windows(&mut self) {
+        let current_window_ids: HashSet<WindowId> = match self.app.windows() {
+            Ok(elems) => elems.iter().filter_map(|elem| self.id(&elem).ok()).collect(),
+            Err(e) => {
+                trace!(?e, "Failed to get windows; checking each tracked window");
+                let mut to_remove = Vec::new();
+                for (&wid, window) in self.windows.iter() {
+                    // InvalidUIElement means the window is gone
+                    if matches!(window.elem.role(), Err(AxError::Ax(AXError::InvalidUIElement))) {
+                        to_remove.push(wid);
+                    }
+                }
+                for wid in to_remove {
+                    self.remove_tracked_window(wid, "Removed stale window (individual check)");
+                }
+                return;
+            }
+        };
+
+        let tracked_wids: Vec<WindowId> = self.windows.keys().copied().collect();
+        for wid in tracked_wids {
+            if !current_window_ids.contains(&wid) {
+                self.remove_tracked_window(wid, "Removed stale window (not in current list)");
+            }
+        }
+    }
+
+    fn remove_tracked_window(&mut self, wid: WindowId, reason: &'static str) {
+        if self.windows.remove(&wid).is_some() {
+            debug!(?wid, reason);
+            self.send_event(Event::WindowDestroyed(wid));
+        }
+    }
+
     fn send_event(&self, event: Event) { self.events_tx.send(event); }
 
-    fn window(&self, wid: WindowId) -> Result<&WindowState, AxError> {
+    fn window(&self, wid: WindowId) -> Result<&AppWindowState, AxError> {
         assert_eq!(wid.pid, self.pid);
         self.windows.get(&wid).ok_or(AxError::NotFound)
     }
 
-    fn window_mut(&mut self, wid: WindowId) -> Result<&mut WindowState, AxError> {
+    fn window_mut(&mut self, wid: WindowId) -> Result<&mut AppWindowState, AxError> {
         assert_eq!(wid.pid, self.pid);
         self.windows.get_mut(&wid).ok_or(AxError::NotFound)
     }
@@ -1319,7 +1369,6 @@ fn app_thread_main(
         observer,
         events_tx,
         windows: HashMap::default(),
-        needs_resync: HashSet::default(),
         last_window_idx: 0,
         main_window: None,
         last_activated: None,

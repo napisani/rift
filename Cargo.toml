@@ -19,10 +19,13 @@ split-debuginfo = "packed"
 panic = "unwind"
 
 [profile.release]
+opt-level = 3
 debug = 1
 codegen-units = 1
 panic = "abort"
-incremental = true
+incremental = false
+lto = "thin"
+strip = true
 
 [lib]
 doctest = false
@@ -44,6 +47,7 @@ objc2-app-kit = { version = "0.3.1", default-features = false, features = [
 	"NSButton",
 	"NSColor",
 	"NSControl",
+	"NSCursor",
 	"NSEvent",
 	"NSFont",
 	"NSGraphics",

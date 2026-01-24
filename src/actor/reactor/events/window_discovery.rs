@@ -1,7 +1,7 @@
 use tracing::{trace, warn};
 
 use crate::actor::app::{AppInfo, WindowId, WindowInfo, pid_t};
-use crate::actor::reactor::{Event, LayoutEvent, Reactor, WindowState, utils};
+use crate::actor::reactor::{Event, LayoutEvent, Reactor, WindowFilter, WindowState, utils};
 use crate::common::collections::{BTreeMap, HashSet};
 use crate::model::virtual_workspace::AppRuleResult;
 use crate::sys::screen::SpaceId;
@@ -29,9 +29,8 @@ impl WindowDiscoveryHandler {
         let (stale_windows, pending_refresh) =
             Self::identify_stale_windows(reactor, pid, &known_visible);
         Self::cleanup_stale_windows(reactor, pid, stale_windows, pending_refresh);
-        let (new_windows, updated_windows) =
-            Self::process_window_list(reactor, pid, new, &known_visible, &app_info);
-        Self::update_window_states(reactor, pid, new_windows, updated_windows, &app_info);
+        let new_windows = Self::process_window_list(reactor, new, &app_info);
+        Self::update_window_states(reactor, new_windows, &app_info);
 
         Self::emit_layout_events(reactor, pid, &known_visible, &app_info);
     }
@@ -66,16 +65,16 @@ impl WindowDiscoveryHandler {
             || reactor.is_mission_control_active()
             || reactor.is_in_drag()
             || reactor.pid_has_changing_screens(pid)
-            || reactor.get_active_drag_session().map_or(false, |s| s.window.pid == pid)
             || (known_visible_set.is_empty()
                 && !reactor.has_visible_window_server_ids_for_pid(pid))
             || has_window_server_visibles_without_ax;
 
-        let active_space_windows: Option<HashSet<WindowServerId>> = if skip_stale_cleanup {
-            None
-        } else {
-            let active_space_ids: Vec<u64> =
-                reactor.space_manager.iter_known_spaces().map(|space| space.get()).collect();
+        if skip_stale_cleanup {
+            return (Vec::new(), false);
+        }
+
+        let active_space_windows: Option<HashSet<WindowServerId>> = {
+            let active_space_ids = reactor.active_space_ids();
 
             if active_space_ids.is_empty() {
                 None
@@ -91,91 +90,80 @@ impl WindowDiscoveryHandler {
             }
         };
 
-        match skip_stale_cleanup {
-            true => return (Vec::new(), false),
-            false => {
-                return (
-                    reactor
-                        .window_manager
-                        .windows
-                        .iter()
-                        .filter_map(|(&wid, state)| {
-                            if wid.pid != pid || known_visible_set.contains(&wid) {
-                                return None;
-                            }
+        let stale_windows = reactor
+            .window_manager
+            .windows
+            .iter()
+            .filter_map(|(&wid, state)| {
+                if wid.pid != pid || known_visible_set.contains(&wid) {
+                    return None;
+                }
 
-                            if state.is_minimized {
-                                return None;
-                            }
+                if state.info.is_minimized {
+                    return None;
+                }
 
-                            let Some(ws_id) = state.window_server_id else {
-                                trace!(
-                                    ?wid,
-                                    "Skipping stale cleanup for window without window server id"
-                                );
-                                return None;
-                            };
+                let Some(ws_id) = state.info.sys_id else {
+                    trace!(
+                        ?wid,
+                        "Skipping stale cleanup for window without window server id"
+                    );
+                    return None;
+                };
 
-                            if let Some(active_windows) = active_space_windows.as_ref() {
-                                if !active_windows.contains(&ws_id) {
-                                    trace!(
-                                        ?wid,
-                                        ws_id = ?ws_id,
-                                        "Skipping stale cleanup; window is not on an active space"
-                                    );
-                                    return None;
-                                }
-                            }
+                let is_on_active_space =
+                    active_space_windows.as_ref().map_or(false, |set| set.contains(&ws_id));
+                if active_space_windows.is_some() && !is_on_active_space {
+                    trace!(
+                        ?wid,
+                        ws_id = ?ws_id,
+                        "Skipping stale cleanup; window is not on an active space"
+                    );
+                    return None;
+                }
 
-                            let server_info = reactor
-                                .window_server_info_manager
-                                .window_server_info
-                                .get(&ws_id)
-                                .cloned()
-                                .or_else(|| window_server::get_window(ws_id));
+                let server_info = reactor
+                    .window_server_info_manager
+                    .window_server_info
+                    .get(&ws_id)
+                    .cloned()
+                    .or_else(|| window_server::get_window(ws_id));
 
-                            let info = match server_info {
-                                Some(info) => info,
-                                None => {
-                                    trace!(
-                                        ?wid,
-                                        ws_id = ?ws_id,
-                                        "Skipping stale cleanup for window without server info"
-                                    );
-                                    return None;
-                                }
-                            };
+                let info = match server_info {
+                    Some(info) => info,
+                    None => {
+                        trace!(
+                            ?wid,
+                            ws_id = ?ws_id,
+                            "Skipping stale cleanup for window without server info"
+                        );
+                        return None;
+                    }
+                };
 
-                            let width = info.frame.size.width.abs();
-                            let height = info.frame.size.height.abs();
+                let width = info.frame.size.width.abs();
+                let height = info.frame.size.height.abs();
 
-                            let unsuitable = !window_server::app_window_suitable(ws_id);
-                            let invalid_layer = info.layer != 0;
-                            let too_small = width < MIN_REAL_WINDOW_DIMENSION
-                                || height < MIN_REAL_WINDOW_DIMENSION;
-                            let ordered_in = window_server::window_is_ordered_in(ws_id);
-                            let visible_in_snapshot =
-                                reactor.window_manager.visible_windows.contains(&ws_id);
+                let unsuitable = !window_server::app_window_suitable(ws_id);
+                let invalid_layer = info.layer != 0;
+                let too_small =
+                    width < MIN_REAL_WINDOW_DIMENSION || height < MIN_REAL_WINDOW_DIMENSION;
+                let ordered_in = window_server::window_is_ordered_in(ws_id);
+                let visible_in_snapshot = reactor.window_manager.visible_windows.contains(&ws_id);
 
-                            let is_on_active_space = active_space_windows
-                                .as_ref()
-                                .map_or(false, |set| set.contains(&ws_id));
+                if unsuitable
+                    || invalid_layer
+                    || too_small
+                    || (is_on_active_space && !ordered_in && !visible_in_snapshot)
+                {
+                    Some(wid)
+                } else {
+                    None
+                }
+            })
+            .collect();
 
-                            if unsuitable
-                                || invalid_layer
-                                || too_small
-                                || (is_on_active_space && !ordered_in && !visible_in_snapshot)
-                            {
-                                Some(wid)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect(),
-                    pending_refresh,
-                );
-            }
-        }
+        (stale_windows, pending_refresh)
     }
 
     /// Remove stale windows and send events.
@@ -196,15 +184,12 @@ impl WindowDiscoveryHandler {
     /// Process new and updated windows, returning lists of new and updated windows.
     fn process_window_list(
         reactor: &mut Reactor,
-        _pid: pid_t,
         new: Vec<(WindowId, WindowInfo)>,
-        _known_visible: &[WindowId],
         app_info: &Option<AppInfo>,
-    ) -> (Vec<(WindowId, WindowInfo)>, Vec<(WindowId, WindowInfo)>) {
+    ) -> Vec<(WindowId, WindowInfo)> {
         const APP_RULE_TTL_MS: u64 = 1000;
 
         let mut new_windows = Vec::new();
-        let mut updated_windows = Vec::new();
 
         reactor.app_manager.purge_expired(APP_RULE_TTL_MS);
 
@@ -228,40 +213,27 @@ impl WindowDiscoveryHandler {
                         &reactor.window_server_info_manager.window_server_info,
                     );
                     if let Some(existing) = reactor.window_manager.windows.get_mut(wid) {
-                        existing.title = info.title.clone();
+                        existing.info.title = info.title.clone();
                         if info.frame.size.width != 0.0 || info.frame.size.height != 0.0 {
                             existing.frame_monotonic = info.frame;
                         }
-                        existing.is_ax_standard = info.is_standard;
-                        existing.is_ax_root = info.is_root;
-                        existing.is_minimized = info.is_minimized;
-                        existing.window_server_id = info.sys_id;
-                        existing.bundle_id = info.bundle_id.clone();
-                        existing.bundle_path = info.path.clone();
-                        existing.ax_role = info.ax_role.clone();
-                        existing.ax_subrole = info.ax_subrole.clone();
+                        existing.info.is_standard = info.is_standard;
+                        existing.info.is_root = info.is_root;
+                        existing.info.is_minimized = info.is_minimized;
+                        existing.info.sys_id = info.sys_id;
+                        existing.info.bundle_id = info.bundle_id.clone();
+                        existing.info.path = info.path.clone();
+                        existing.info.ax_role = info.ax_role.clone();
+                        existing.info.ax_subrole = info.ax_subrole.clone();
                         existing.is_manageable = manageable;
                     }
                 } else {
-                    let mut state: WindowState = WindowState {
-                        title: info.title.clone(),
-                        frame_monotonic: info.frame,
-                        is_ax_standard: info.is_standard,
-                        is_ax_root: info.is_root,
-                        is_minimized: info.is_minimized,
-                        is_manageable: false,
-                        ignore_app_rule: false,
-                        window_server_id: info.sys_id,
-                        bundle_id: info.bundle_id.clone(),
-                        bundle_path: info.path.clone(),
-                        ax_role: info.ax_role.clone(),
-                        ax_subrole: info.ax_subrole.clone(),
-                    };
+                    let mut state: WindowState = WindowState::from((*info).clone());
                     let manageable = utils::compute_window_manageability(
-                        state.window_server_id,
-                        state.is_minimized,
-                        state.is_ax_standard,
-                        state.is_ax_root,
+                        state.info.sys_id,
+                        state.info.is_minimized,
+                        state.info.is_standard,
+                        state.info.is_root,
                         &reactor.window_server_info_manager.window_server_info,
                     );
                     state.is_manageable = manageable;
@@ -276,44 +248,33 @@ impl WindowDiscoveryHandler {
 
         // Process all new windows
         for (wid, info) in new {
+            if let Some(wsid) = info.sys_id {
+                reactor.window_manager.window_ids.insert(wsid, wid);
+            }
             if reactor.window_manager.windows.contains_key(&wid) {
-                updated_windows.push((wid, info));
+                // window state is already tracked; keep for layout sync only
             } else {
                 new_windows.push((wid, info));
             }
         }
 
-        (new_windows, updated_windows)
+        new_windows
     }
 
     /// Update window states in Reactor.
     fn update_window_states(
         reactor: &mut Reactor,
-        _pid: pid_t,
         new_windows: Vec<(WindowId, WindowInfo)>,
-        updated_windows: Vec<(WindowId, WindowInfo)>,
         _app_info: &Option<AppInfo>,
     ) {
-        // Update window IDs for new windows
-        for (wid, info) in &new_windows {
-            if let Some(wsid) = info.sys_id {
-                reactor.window_manager.window_ids.insert(wsid, *wid);
-            }
-        }
-        for (wid, info) in &updated_windows {
-            if let Some(wsid) = info.sys_id {
-                reactor.window_manager.window_ids.insert(wsid, *wid);
-            }
-        }
-
         // Update or insert window states
         for (wid, info) in new_windows {
             let mut state: WindowState = info.into();
             let manageable = utils::compute_window_manageability(
-                state.window_server_id,
-                state.is_minimized,
-                state.is_ax_standard,
-                state.is_ax_root,
+                state.info.sys_id,
+                state.info.is_minimized,
+                state.info.is_standard,
+                state.info.is_root,
                 &reactor.window_server_info_manager.window_server_info,
             );
             state.is_manageable = manageable;
@@ -362,7 +323,7 @@ impl WindowDiscoveryHandler {
                 continue;
             };
             let Some(space) =
-                reactor.best_space_for_window(&state.frame_monotonic, state.window_server_id)
+                reactor.best_space_for_window(&state.frame_monotonic, state.info.sys_id)
             else {
                 continue;
             };
@@ -376,7 +337,7 @@ impl WindowDiscoveryHandler {
 
         let screens = reactor.space_manager.screens.clone();
         for screen in screens {
-            let Some(space) = reactor.space_manager.space_for_screen(&screen) else {
+            let Some(space) = screen.space else {
                 continue;
             };
             if !reactor.is_space_active(space) {
@@ -387,7 +348,7 @@ impl WindowDiscoveryHandler {
             if !windows_for_space.is_empty() {
                 for wid in &windows_for_space {
                     let title_opt =
-                        reactor.window_manager.windows.get(wid).map(|w| w.title.clone());
+                        reactor.window_manager.windows.get(wid).map(|w| w.info.title.clone());
                     let assign_result = reactor
                         .layout_manager
                         .layout_engine
@@ -402,12 +363,12 @@ impl WindowDiscoveryHandler {
                                 .window_manager
                                 .windows
                                 .get(wid)
-                                .and_then(|w| w.ax_role.as_deref()),
+                                .and_then(|w| w.info.ax_role.as_deref()),
                             reactor
                                 .window_manager
                                 .windows
                                 .get(wid)
-                                .and_then(|w| w.ax_subrole.as_deref()),
+                                .and_then(|w| w.info.ax_subrole.as_deref()),
                         );
 
                     match assign_result {
@@ -444,22 +405,17 @@ impl WindowDiscoveryHandler {
                 Option<String>,
             )> = windows_for_space
                 .iter()
-                .filter(|&&wid| {
-                    reactor
-                        .window_manager
-                        .windows
-                        .get(&wid)
-                        .map(|window| window.is_effectively_manageable())
-                        .unwrap_or(false)
-                })
-                .map(|&wid| {
-                    let title_opt =
-                        reactor.window_manager.windows.get(&wid).map(|w| w.title.clone());
-                    let ax_role =
-                        reactor.window_manager.windows.get(&wid).and_then(|w| w.ax_role.clone());
-                    let ax_subrole =
-                        reactor.window_manager.windows.get(&wid).and_then(|w| w.ax_subrole.clone());
-                    (wid, title_opt, ax_role, ax_subrole)
+                .filter_map(|&wid| {
+                    let window = reactor.window_manager.windows.get(&wid)?;
+                    if !window.matches_filter(WindowFilter::EffectivelyManageable) {
+                        return None;
+                    }
+                    Some((
+                        wid,
+                        Some(window.info.title.clone()),
+                        window.info.ax_role.clone(),
+                        window.info.ax_subrole.clone(),
+                    ))
                 })
                 .collect();
 

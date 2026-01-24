@@ -25,6 +25,7 @@ use crate::common::config::{
 use crate::model::VirtualWorkspaceId;
 use crate::model::server::{WindowData, WorkspaceData};
 use crate::sys::screen::SpaceId;
+use crate::ui::compute_window_layout_metrics;
 
 const CELL_WIDTH: f64 = 20.0;
 const CELL_HEIGHT: f64 = 15.0;
@@ -201,7 +202,7 @@ struct MenuIconLayout {
 struct WorkspaceRenderData {
     bg_rect: CGRect,
     fill_alpha: f64,
-    windows: Vec<WindowRenderRect>,
+    windows: Vec<CGRect>,
     label_line: Option<CachedTextLine>,
     show_windows: bool,
 }
@@ -210,13 +211,6 @@ struct WorkspaceRenderInput {
     workspace: WorkspaceData,
     label: String,
     show_windows: bool,
-}
-
-struct WindowRenderRect {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
 }
 
 struct CachedTextLine {
@@ -338,78 +332,25 @@ fn build_layout(
         };
 
         let windows = if input.show_windows && !workspace.windows.is_empty() {
-            let min_x =
-                workspace.windows.iter().map(|w| w.frame.origin.x).fold(f64::INFINITY, f64::min);
-            let min_y =
-                workspace.windows.iter().map(|w| w.frame.origin.y).fold(f64::INFINITY, f64::min);
-            let max_x = workspace
-                .windows
-                .iter()
-                .map(|w| w.frame.origin.x + w.frame.size.width)
-                .fold(f64::NEG_INFINITY, f64::max);
-            let max_y = workspace
-                .windows
-                .iter()
-                .map(|w| w.frame.origin.y + w.frame.size.height)
-                .fold(f64::NEG_INFINITY, f64::max);
-
-            let disp_w = (max_x - min_x).max(1.0);
-            let disp_h = (max_y - min_y).max(1.0);
-
-            let cx = bg_x + CONTENT_INSET;
-            let cy = bg_y + CONTENT_INSET;
-            let cw = (CELL_WIDTH - 2.0 * CONTENT_INSET).max(1.0);
-            let ch = (CELL_HEIGHT - 2.0 * CONTENT_INSET).max(1.0);
-
-            let scaling = if disp_h > disp_w {
-                disp_h / ch
-            } else {
-                disp_w / cw
-            };
-            let sf = 1.0 / scaling;
-
-            let xoffset = if disp_h > disp_w {
-                (cw - disp_w * sf) / 2.0
-            } else {
-                0.0
-            } + cx;
-            let yoffset = if disp_h > disp_w {
-                0.0
-            } else {
-                (ch - disp_h * sf) / 2.0
-            } + cy;
-
-            let mut rects = Vec::with_capacity(workspace.windows.len());
-            for window in workspace.windows.iter().rev() {
-                let wx = window.frame.origin.x - min_x;
-                let wy_top = window.frame.origin.y - min_y + window.frame.size.height;
-                let wy = disp_h - wy_top;
-                let ww = window.frame.size.width;
-                let wh = window.frame.size.height;
-
-                let mut rx = xoffset + wx * sf;
-                let mut ry = yoffset + wy * sf;
-                let mut rw = (ww * sf).max(2.0);
-                let mut rh = (wh * sf).max(2.0);
-
+            let layout = compute_window_layout_metrics(
+                &workspace.windows,
+                bg_rect,
+                CONTENT_INSET,
+                1.0,
+                None,
+            );
+            if let Some(layout) = layout {
+                const MIN_TILE_SIZE: f64 = 2.0;
                 const WIN_GAP: f64 = 0.75;
-                if rw > (2.0 + WIN_GAP) {
-                    rx += WIN_GAP / 2.0;
-                    rw -= WIN_GAP;
+                let mut rects = Vec::with_capacity(workspace.windows.len());
+                for window in workspace.windows.iter().rev() {
+                    let rect = layout.rect_for(window, MIN_TILE_SIZE, WIN_GAP);
+                    rects.push(rect);
                 }
-                if rh > (2.0 + WIN_GAP) {
-                    ry += WIN_GAP / 2.0;
-                    rh -= WIN_GAP;
-                }
-
-                rects.push(WindowRenderRect {
-                    x: rx,
-                    y: ry,
-                    width: rw,
-                    height: rh,
-                });
+                rects
+            } else {
+                Vec::new()
             }
-            rects
         } else {
             Vec::new()
         };
@@ -517,10 +458,10 @@ define_class!(
                         for window in workspace.windows.iter() {
                             add_rounded_rect(
                                 cg,
-                                window.x,
-                                window.y + y_offset,
-                                window.width,
-                                window.height,
+                                window.origin.x,
+                                window.origin.y + y_offset,
+                                window.size.width,
+                                window.size.height,
                                 1.5,
                             );
                             CGContext::set_rgb_fill_color(Some(cg), 1.0, 1.0, 1.0, 1.0);
@@ -532,10 +473,10 @@ define_class!(
                             CGContext::set_line_width(Some(cg), 1.5);
                             add_rounded_rect(
                                 cg,
-                                window.x,
-                                window.y,
-                                window.width,
-                                window.height,
+                                window.origin.x,
+                                window.origin.y,
+                                window.size.width,
+                                window.size.height,
                                 1.5,
                             );
                             CGContext::stroke_path(Some(cg));

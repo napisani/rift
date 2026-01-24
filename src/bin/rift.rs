@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::PathBuf;
 use std::process;
 
@@ -26,7 +27,9 @@ use rift_wm::sys::accessibility::ensure_accessibility_permission;
 use rift_wm::sys::executor::Executor;
 use rift_wm::sys::screen::{CoordinateConverter, displays_have_separate_spaces};
 use rift_wm::sys::service::{ServiceCommands, handle_service_command};
-use rift_wm::sys::skylight::{CGSEventType, KnownCGSEvent};
+use rift_wm::sys::skylight::{
+    CGEnableEventStateCombining, CGSEventType, CGSetLocalEventsSuppressionInterval, KnownCGSEvent,
+};
 use tokio::join;
 
 embed_plist::embed_info_plist!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/Info.plist"));
@@ -77,6 +80,14 @@ enum Commands {
         #[command(subcommand)]
         service: ServiceCommands,
     },
+}
+
+/// this is okay because there is no recovery mechanism for actors
+/// so we want to immediately exit (and most likely restart since
+/// rift runs as a service most of the time)
+async fn supervise(name: &'static str, fut: impl Future<Output = ()>) {
+    fut.await;
+    panic!("{name} exited");
 }
 
 fn main() {
@@ -155,7 +166,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
     let (stack_line_tx, stack_line_rx) = rift_wm::actor::channel();
     let (wnd_tx, wnd_rx) = rift_wm::actor::channel();
     let window_tx_store = WindowTxStore::new();
-    let events_tx = Reactor::spawn(
+    let reactor = Reactor::spawn(
         config.clone(),
         layout,
         reactor::Record::new(opt.record.as_deref()),
@@ -164,7 +175,9 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         menu_tx.clone(),
         stack_line_tx.clone(),
         Some((wnd_tx.clone(), window_tx_store.clone())),
+        opt.one,
     );
+    let events_tx = reactor.sender();
 
     let config_tx =
         ConfigActor::spawn_with_path(config.clone(), events_tx.clone(), config_path.clone());
@@ -177,14 +190,15 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         &[
             CGSEventType::Known(KnownCGSEvent::SpaceWindowDestroyed),
             CGSEventType::Known(KnownCGSEvent::SpaceWindowCreated),
+            CGSEventType::Known(KnownCGSEvent::SpaceCreated),
+            CGSEventType::Known(KnownCGSEvent::SpaceDestroyed),
             //CGSEventType::Known(KnownCGSEvent::WindowMoved),
             //CGSEventType::Known(KnownCGSEvent::WindowResized),
         ],
         Some(window_tx_store.clone()),
     );
 
-    let events_tx_mach = events_tx.clone();
-    let server_state = match ipc::run_mach_server(events_tx_mach, config_tx.clone()) {
+    let server_state = match ipc::run_mach_server(reactor.clone(), config_tx.clone()) {
         Ok(state) => state,
         Err(err) => {
             eprintln!("{}", err);
@@ -212,7 +226,6 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
     });
 
     let wm_config = wm_controller::Config {
-        one_space: opt.one,
         restore_file: restore_file(),
         config: config.clone(),
     };
@@ -238,6 +251,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         events_tx.clone(),
         event_tap_rx,
         Some(wm_controller_sender.clone()),
+        Some(stack_line_tx.clone()),
     );
     let menu = Menu::new(config.clone(), menu_rx, mtm);
     let stack_line = StackLine::new(
@@ -248,7 +262,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         CoordinateConverter::default(),
     );
 
-    let mission_control = MissionControlActor::new(config.clone(), mc_rx, events_tx.clone(), mtm);
+    let mission_control = MissionControlActor::new(config.clone(), mc_rx, reactor.clone(), mtm);
     let mission_control_native = NativeMissionControl::new(events_tx.clone(), mc_native_rx);
 
     println!(
@@ -259,17 +273,23 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
 
     unsafe { AXUIElement::new_system_wide().set_messaging_timeout(1.0) };
 
-    let _executor_session = Executor::run_main(mtm, async move {
+    CGSetLocalEventsSuppressionInterval(0.0);
+    CGEnableEventStateCombining(false);
+
+    Executor::run_main(mtm, async move {
         join!(
-            wm_controller.run(),
-            notification_center.watch_for_notifications(),
-            event_tap.run(),
-            menu.run(),
-            stack_line.run(),
-            wn_actor.run(),
-            mission_control_native.run(),
-            mission_control.run(),
-            process_actor.run()
+            supervise("wm_controller", wm_controller.run()),
+            supervise(
+                "notification_center",
+                notification_center.watch_for_notifications()
+            ),
+            supervise("event_tap", event_tap.run()),
+            supervise("menu", menu.run()),
+            supervise("stack_line", stack_line.run()),
+            supervise("window_notify", wn_actor.run()),
+            supervise("mc_native", mission_control_native.run()),
+            supervise("mission_control", mission_control.run()),
+            supervise("process_actor", process_actor.run()),
         );
     });
 }

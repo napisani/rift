@@ -6,7 +6,9 @@ use std::ptr::NonNull;
 use objc2::rc::Retained;
 use objc2::{ClassType, msg_send};
 use objc2_app_kit::NSScreen;
-use objc2_core_foundation::{CFRetained, CFString, CGPoint, CGRect, CGSize};
+use objc2_core_foundation::{
+    CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
+};
 use objc2_core_graphics::{CGDisplayBounds, CGError, CGGetActiveDisplayList, CGMainDisplayID};
 use objc2_foundation::{MainThreadMarker, NSArray, NSNumber, ns_string};
 use serde::{Deserialize, Serialize};
@@ -20,6 +22,8 @@ use super::skylight::{
     SLSGetDisplayMenubarHeight, SLSGetDockRectWithReason, SLSGetMenuBarAutohideEnabled,
     SLSGetSpaceManagementMode, SLSMainConnectionID,
 };
+use crate::common::collections::HashMap;
+use crate::sys::geometry::CGRectDef;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[repr(transparent)]
@@ -41,9 +45,8 @@ impl ToString for SpaceId {
 
 #[derive(Debug, Clone)]
 struct ScreenState {
-    descriptors: Vec<ScreenDescriptor>,
+    screens: Vec<ScreenInfo>,
     converter: CoordinateConverter,
-    spaces: Vec<Option<SpaceId>>,
 }
 
 pub struct ScreenCache<S: System = Actual> {
@@ -55,12 +58,28 @@ pub struct ScreenCache<S: System = Actual> {
     sleeping: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ScreenDescriptor {
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScreenInfo {
     pub id: ScreenId,
+    #[serde(with = "CGRectDef")]
     pub frame: CGRect,
     pub display_uuid: String,
     pub name: Option<String>,
+    pub space: Option<SpaceId>,
+}
+
+impl ScreenInfo {
+    pub fn display_uuid_opt(&self) -> Option<&str> {
+        if self.display_uuid.is_empty() {
+            None
+        } else {
+            Some(self.display_uuid.as_str())
+        }
+    }
+
+    pub fn display_uuid_owned(&self) -> Option<String> {
+        self.display_uuid_opt().map(|uuid| uuid.to_string())
+    }
 }
 
 impl ScreenCache<Actual> {
@@ -90,10 +109,8 @@ impl<S: System> ScreenCache<S> {
         }
     }
 
-    pub fn refresh(
-        &mut self,
-    ) -> Option<(Vec<ScreenDescriptor>, CoordinateConverter, Vec<Option<SpaceId>>)> {
-        self.refresh_snapshot(false).map(|s| (s.descriptors, s.converter, s.spaces))
+    pub fn refresh(&mut self) -> Option<(Vec<ScreenInfo>, CoordinateConverter)> {
+        self.refresh_snapshot(false).map(|s| (s.screens, s.converter))
     }
 
     fn refresh_snapshot(&mut self, force: bool) -> Option<ScreenState> {
@@ -120,7 +137,16 @@ impl<S: System> ScreenCache<S> {
                 .collect();
 
             if let Some(state) = self.state.clone() {
-                return Some(ScreenState { spaces, ..state });
+                let screens = state
+                    .screens
+                    .into_iter()
+                    .zip(spaces)
+                    .map(|(mut screen, space)| {
+                        screen.space = space;
+                        screen
+                    })
+                    .collect();
+                return Some(ScreenState { screens, ..state });
             }
             return None;
         }
@@ -133,9 +159,8 @@ impl<S: System> ScreenCache<S> {
         if cg_screens.is_empty() {
             self.uuids.clear();
             let state = ScreenState {
-                descriptors: Vec::new(),
+                screens: Vec::new(),
                 converter: CoordinateConverter::default(),
-                spaces: Vec::new(),
             };
             self.state = Some(state.clone());
             self.processed_generation = self.pending_generation;
@@ -168,7 +193,7 @@ impl<S: System> ScreenCache<S> {
             .fold(f64::NEG_INFINITY, f64::max);
         let converter = CoordinateConverter { screen_height: union_max_y };
 
-        let descriptors: Vec<ScreenDescriptor> = cg_screens
+        let screens: Vec<ScreenInfo> = cg_screens
             .iter()
             .enumerate()
             .map(|(idx, &CGScreenInfo { cg_id, bounds })| {
@@ -181,11 +206,12 @@ impl<S: System> ScreenCache<S> {
                             format!("cgdisplay-{}", cg_id.as_u32())
                         },
                     );
-                ScreenDescriptor {
+                ScreenInfo {
                     id: cg_id,
                     frame,
                     display_uuid,
                     name: ns_screens.iter().find(|s| s.cg_id == cg_id).and_then(|s| s.name.clone()),
+                    space: None,
                 }
             })
             .collect();
@@ -203,7 +229,15 @@ impl<S: System> ScreenCache<S> {
 
         self.uuids = uuids;
         self.processed_generation = self.pending_generation;
-        self.state = Some(ScreenState { descriptors, converter, spaces });
+        let screens = screens
+            .into_iter()
+            .zip(spaces)
+            .map(|(mut screen, space)| {
+                screen.space = space;
+                screen
+            })
+            .collect();
+        self.state = Some(ScreenState { screens, converter });
         self.state.clone()
     }
 }
@@ -497,7 +531,7 @@ impl System for Actual {
 
 type CGDirectDisplayID = u32;
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ScreenId(CGDirectDisplayID);
 
 impl ScreenId {
@@ -597,6 +631,62 @@ pub fn order_visible_spaces_by_position(
     });
 
     spaces.into_iter().map(|(space, _)| space).collect()
+}
+
+pub fn managed_display_space_ids() -> HashMap<String, Vec<SpaceId>> {
+    let mut out: HashMap<String, Vec<SpaceId>> = HashMap::default();
+    unsafe {
+        let raw = CGSCopyManagedDisplaySpaces(SLSMainConnectionID());
+        if raw.is_null() {
+            return out;
+        }
+
+        let displays: CFRetained<CFArray<CFDictionary<CFString, CFType>>> =
+            CFRetained::from_raw(std::ptr::NonNull::new_unchecked(raw.cast()));
+        let display_id_key = CFString::from_static_str("Display Identifier");
+        let spaces_key = CFString::from_static_str("Spaces");
+        let managed_space_id_key = CFString::from_static_str("ManagedSpaceID");
+
+        for idx in 0..displays.len() {
+            let Some(display_entry) = displays.get(idx) else {
+                continue;
+            };
+            let display_id = display_entry
+                .get(&display_id_key)
+                .and_then(|v| v.downcast::<CFString>().ok())
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            if display_id.is_empty() {
+                continue;
+            }
+
+            let mut space_ids = Vec::new();
+            if let Some(spaces_value) = display_entry.get(&spaces_key) {
+                if let Ok(spaces) = spaces_value.downcast::<CFArray>() {
+                    let spaces = CFRetained::cast_unchecked::<CFArray<CFType>>(spaces);
+                    for space_entry in spaces.iter() {
+                        if let Ok(space_dict) = space_entry.downcast::<CFDictionary>() {
+                            let space_dict = CFRetained::cast_unchecked::<
+                                CFDictionary<CFString, CFType>,
+                            >(space_dict);
+                            let space_id = space_dict
+                                .get(&managed_space_id_key)
+                                .and_then(|v| v.downcast::<CFNumber>().ok())
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0);
+                            if space_id != 0 {
+                                space_ids.push(SpaceId::new(space_id as u64));
+                            }
+                        }
+                    }
+                }
+            }
+
+            out.insert(display_id, space_ids);
+        }
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -700,12 +790,12 @@ mod test {
             ],
         };
         let mut sc = ScreenCache::new_with(stub);
-        let (descriptors, _, _) = sc.refresh().unwrap();
-        let frames: Vec<CGRect> = descriptors.iter().map(|d| d.frame).collect();
+        let (screens, _) = sc.refresh().unwrap();
+        let frames: Vec<CGRect> = screens.iter().map(|d| d.frame).collect();
         assert_eq!(
             vec![
-                CGRect::new(CGPoint::new(0.0, 25.0), CGSize::new(3840.0, 2059.0)),
-                CGRect::new(CGPoint::new(3840.0, 1112.0), CGSize::new(1512.0, 950.0)),
+                CGRect::new(CGPoint::new(3840.0, 1080.0), CGSize::new(1512.0, 982.0)),
+                CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(3840.0, 2160.0)),
             ],
             frames
         );
@@ -732,12 +822,13 @@ mod test {
 
         let mut cache = ScreenCache::new_with(system);
 
-        let (descriptors, _, _) = cache.refresh().unwrap();
-        assert_eq!(descriptors.len(), 1);
+        let (screens, _) = cache.refresh().unwrap();
+        assert_eq!(screens.len(), 1);
         assert_eq!(cache.uuids.len(), 1);
 
-        let (descriptors, converter, _) = cache.refresh().unwrap();
-        assert!(descriptors.is_empty());
+        cache.mark_dirty();
+        let (screens, converter) = cache.refresh().unwrap();
+        assert!(screens.is_empty());
         assert!(cache.uuids.is_empty());
         assert!(converter.convert_point(CGPoint::new(0.0, 0.0)).is_none());
     }

@@ -1,15 +1,16 @@
-use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 
 use objc2_app_kit::NSRunningApplication;
+use objc2_core_foundation::CGSize;
 use tracing::{debug, info, trace, warn};
 
 use crate::actor::app::Request;
 use crate::actor::reactor::{
-    Event, FullscreenTrack, MissionControlState, PendingSpaceChange, Reactor, Screen,
-    ScreenSnapshot, StaleCleanupState,
+    Event, FullscreenSpaceTrack, FullscreenWindowTrack, LayoutEvent, PendingSpaceChange, Reactor,
+    ScreenInfo, StaleCleanupState,
 };
 use crate::actor::wm_controller::WmEvent;
+use crate::common::collections::{HashMap, HashSet};
 use crate::sys::app::AppInfo;
 use crate::sys::screen::{ScreenId, SpaceId};
 use crate::sys::window_server::{WindowServerId, WindowServerInfo};
@@ -23,34 +24,29 @@ impl SpaceEventHandler {
         sid: SpaceId,
     ) {
         if crate::sys::window_server::space_is_fullscreen(sid.get()) {
-            let entry = match reactor.space_manager.fullscreen_by_space.entry(sid.get()) {
-                Entry::Occupied(o) => o.into_mut(),
-                Entry::Vacant(v) => v.insert(FullscreenTrack::default()),
-            };
-            if let Some(&wid) = reactor.window_manager.window_ids.get(&wsid) {
-                entry.pids.insert(wid.pid);
-                if entry.last_removed.len() >= 5 {
-                    entry.last_removed.pop_front();
-                }
-                entry.last_removed.push_back(wsid);
-                if let Some(app_state) = reactor.app_manager.apps.get(&wid.pid) {
-                    if let Err(e) =
-                        app_state.handle.send(Request::MarkWindowsNeedingInfo(vec![wid]))
-                    {
-                        warn!("Failed to send MarkWindowsNeedingInfo: {}", e);
-                    }
-                }
-                return;
+            let (pid, window_id) = if let Some(&wid) = reactor.window_manager.window_ids.get(&wsid)
+            {
+                (wid.pid, Some(wid))
             } else if let Some(info) =
                 reactor.window_server_info_manager.window_server_info.get(&wsid)
             {
-                entry.pids.insert(info.pid);
-                if entry.last_removed.len() >= 5 {
-                    entry.last_removed.pop_front();
-                }
-                entry.last_removed.push_back(wsid);
+                (info.pid, None)
+            } else {
+                // We don't know who owned this fullscreen window.
                 return;
+            };
+
+            let last_known_user_space = resolve_last_known_user_space(reactor, window_id);
+            record_fullscreen_window(reactor, sid, pid, window_id, last_known_user_space);
+
+            if let Some(wid) = window_id
+                && let Some(app_state) = reactor.app_manager.apps.get(&wid.pid)
+            {
+                if let Err(e) = app_state.handle.send(Request::WindowMaybeDestroyed(wid)) {
+                    warn!("Failed to send WindowMaybeDestroyed: {}", e);
+                }
             }
+
             return;
         } else if crate::sys::window_server::space_is_user(sid.get()) {
             if let Some(&wid) = reactor.window_manager.window_ids.get(&wsid) {
@@ -58,13 +54,9 @@ impl SpaceEventHandler {
                 reactor.window_server_info_manager.window_server_info.remove(&wsid);
                 reactor.window_manager.visible_windows.remove(&wsid);
                 if let Some(app_state) = reactor.app_manager.apps.get(&wid.pid) {
-                    if let Err(e) =
-                        app_state.handle.send(Request::MarkWindowsNeedingInfo(vec![wid]))
-                    {
-                        warn!("Failed to send MarkWindowsNeedingInfo: {}", e);
+                    if let Err(e) = app_state.handle.send(Request::WindowMaybeDestroyed(wid)) {
+                        warn!("Failed to send WindowMaybeDestroyed: {}", e);
                     }
-                    let _ =
-                        app_state.handle.send(Request::GetVisibleWindows { force_refresh: true });
                 }
                 if let Some(tx) = reactor.communication_manager.events_tx.as_ref() {
                     tx.send(Event::WindowDestroyed(wid));
@@ -123,41 +115,21 @@ impl SpaceEventHandler {
             }
 
             if crate::sys::window_server::space_is_fullscreen(sid.get()) {
-                let entry = match reactor.space_manager.fullscreen_by_space.entry(sid.get()) {
-                    Entry::Occupied(o) => o.into_mut(),
-                    Entry::Vacant(v) => v.insert(FullscreenTrack::default()),
-                };
-                entry.pids.insert(window_server_info.pid);
-                if entry.last_removed.len() >= 5 {
-                    entry.last_removed.pop_front();
-                }
-                entry.last_removed.push_back(wsid);
-                if let Some(&wid) = reactor.window_manager.window_ids.get(&wsid) {
-                    if let Some(app_state) = reactor.app_manager.apps.get(&wid.pid) {
-                        if let Err(e) =
-                            app_state.handle.send(Request::MarkWindowsNeedingInfo(vec![wid]))
-                        {
-                            warn!("Failed to send MarkWindowsNeedingInfo: {}", e);
-                        }
-                    }
-                } else if let Some(app_state) =
-                    reactor.app_manager.apps.get(&window_server_info.pid)
-                {
-                    let resync: Vec<_> = reactor
-                        .window_manager
-                        .windows
-                        .keys()
-                        .copied()
-                        .filter(|wid| wid.pid == window_server_info.pid)
-                        .collect();
-                    if !resync.is_empty() {
-                        if let Err(e) =
-                            app_state.handle.send(Request::MarkWindowsNeedingInfo(resync))
-                        {
-                            warn!("Failed to send MarkWindowsNeedingInfo: {}", e);
-                        }
-                    }
-                }
+                let window_id = reactor.window_manager.window_ids.get(&wsid).copied();
+                let last_known_user_space = resolve_last_known_user_space(reactor, window_id);
+                record_fullscreen_window(
+                    reactor,
+                    sid,
+                    window_server_info.pid,
+                    window_id,
+                    last_known_user_space,
+                );
+                request_visible_windows(
+                    reactor,
+                    window_server_info.pid,
+                    "refresh after fullscreen appearance",
+                );
+
                 return;
             }
 
@@ -176,9 +148,7 @@ impl SpaceEventHandler {
                     });
                 }
             } else if let Some(app) = reactor.app_manager.apps.get(&window_server_info.pid) {
-                if let Err(err) =
-                    app.handle.send(Request::GetVisibleWindows { force_refresh: false })
-                {
+                if let Err(err) = app.handle.send(Request::GetVisibleWindows) {
                     warn!(
                         pid = window_server_info.pid,
                         ?wsid,
@@ -192,7 +162,7 @@ impl SpaceEventHandler {
 
     pub fn handle_screen_parameters_changed(
         reactor: &mut Reactor,
-        screens: Vec<ScreenSnapshot>,
+        screens: Vec<ScreenInfo>,
         ws_info: Vec<WindowServerInfo>,
     ) {
         let previous_displays: HashSet<String> =
@@ -200,54 +170,110 @@ impl SpaceEventHandler {
         let new_displays: HashSet<String> =
             screens.iter().map(|s| s.display_uuid.clone()).collect();
         let displays_changed = previous_displays != new_displays;
+
+        // IMPORTANT:
+        // Only treat display UUID set changes as a "topology change" once we have a prior known set.
+        // On startup (previous_displays is empty), we'll always see displays_changed=true, but that
+        // should not trigger topology relayout pending. If it does, we can get stuck in a state where
+        // SpaceChanged updates are suppressed/dropped around login window transitions.
+        //
+        // Once we've seen a non-empty display set, allow topology changes that pass through empty
+        // (all displays unplugged/replugged).
+        let should_trigger_topology = displays_changed
+            && (reactor.space_manager.has_seen_display_set || !previous_displays.is_empty());
+
         if displays_changed {
             let active_list: Vec<String> = new_displays.iter().cloned().collect();
             reactor.layout_manager.layout_engine.prune_display_state(&active_list);
         }
+        if !new_displays.is_empty() {
+            reactor.space_manager.has_seen_display_set = true;
+        }
 
-        let spaces: Vec<Option<SpaceId>> = screens.iter().map(|s| s.space).collect();
-        let spaces_all_none = spaces.iter().all(|space| space.is_none());
-        reactor.refocus_manager.stale_cleanup_state = if spaces_all_none {
-            StaleCleanupState::Suppressed
-        } else {
-            StaleCleanupState::Enabled
-        };
-        let mut ws_info_opt = Some(ws_info);
         if screens.is_empty() {
+            update_stale_cleanup_state(reactor, true);
             if !reactor.space_manager.screens.is_empty() {
                 reactor.space_manager.screens.clear();
-                reactor.space_manager.screen_space_by_id.clear();
                 reactor.expose_all_spaces();
             }
+
+            reactor.recompute_and_set_active_spaces(&[]);
+            reactor.update_complete_window_server_info(ws_info);
         } else {
-            reactor.space_manager.screens = screens
-                .into_iter()
-                .map(|snapshot| Screen {
-                    frame: snapshot.frame,
-                    space: snapshot.space,
-                    display_uuid: snapshot.display_uuid,
-                    name: snapshot.name,
-                    screen_id: ScreenId::new(snapshot.screen_id),
+            let spaces: Vec<Option<SpaceId>> = screens.iter().map(|s| s.space).collect();
+            let previous_sizes: HashMap<ScreenId, CGSize> = reactor
+                .space_manager
+                .screens
+                .iter()
+                .map(|screen| (screen.id, screen.frame.size))
+                .collect();
+            reactor.space_manager.screens = screens;
+            let resized_screens: HashSet<ScreenId> = reactor
+                .space_manager
+                .screens
+                .iter()
+                .filter_map(|screen| {
+                    let new_size = screen.frame.size;
+                    match previous_sizes.get(&screen.id) {
+                        Some(previous) => {
+                            let width_changed =
+                                previous.width.round() as i32 != new_size.width.round() as i32;
+                            let height_changed =
+                                previous.height.round() as i32 != new_size.height.round() as i32;
+                            if width_changed || height_changed {
+                                Some(screen.id)
+                            } else {
+                                None
+                            }
+                        }
+                        None => Some(screen.id),
+                    }
                 })
                 .collect();
-            reactor.update_screen_space_map();
-            reactor.set_active_spaces(&spaces);
+
+            let cfg = reactor.activation_cfg();
+            // IMPORTANT: Do not reset login-window state here. When the lock screen / fast user
+            // switching activates the login window, WM emits raw space snapshots and global
+            // activation events. The activation policy must preserve the current login-window
+            // flag across screen parameter changes so it can keep all spaces disabled while
+            // login window is active.
+            let screens = reactor.screens_for_current_spaces();
+            reactor.space_activation_policy.on_spaces_updated(cfg, &screens);
+
+            reactor.recompute_and_set_active_spaces(&spaces);
+
             // Do not remap layout state across reconnects; new space ids can churn and
             // remapping has caused windows to oscillate. Keep existing state and only
             // update the screen→space mapping.
             reactor.reconcile_spaces_with_display_history(&spaces, false);
-            if let Some(info) = ws_info_opt.take() {
-                reactor.finalize_space_change(&spaces, info);
+            if !resized_screens.is_empty() {
+                let resized_info: Vec<(SpaceId, CGSize)> = reactor
+                    .space_manager
+                    .screens
+                    .iter()
+                    .filter(|screen| resized_screens.contains(&screen.id))
+                    .filter_map(|screen| screen.space.map(|s| (s, screen.frame.size)))
+                    .collect();
+
+                for (space, size) in resized_info {
+                    if !reactor.is_space_active(space) {
+                        continue;
+                    }
+                    reactor
+                        .layout_manager
+                        .layout_engine
+                        .virtual_workspace_manager_mut()
+                        .list_workspaces(space);
+                    reactor.send_layout_event(LayoutEvent::SpaceExposed(space, size));
+                }
             }
-        }
-        if let Some(info) = ws_info_opt.take() {
-            reactor.update_complete_window_server_info(info);
+            reactor.finalize_space_change(&spaces, ws_info);
         }
         reactor.try_apply_pending_space_change();
 
         // Mark that we should perform a one-shot relayout after spaces are applied,
         // so windows return to their prior displays post-topology change.
-        if displays_changed {
+        if should_trigger_topology {
             reactor.pending_space_change_manager.topology_relayout_pending = true;
         }
     }
@@ -257,23 +283,23 @@ impl SpaceEventHandler {
         mut spaces: Vec<Option<SpaceId>>,
         ws_info: Vec<WindowServerInfo>,
     ) {
-        // If a topology change is in-flight, ignore space updates that don't match the
-        // current screen count; wait for the matching vector before applying changes.
-        if reactor.pending_space_change_manager.topology_relayout_pending
-            && spaces.len() != reactor.space_manager.screens.len()
-        {
-            println!(
-                "[rift][space_changed] drop mismatch during topology change (screens={}, spaces_len={})",
+        // Also drop any space update that reports more spaces than screens; these are
+        // transient and can reorder active workspaces across displays.
+        if spaces.len() > reactor.space_manager.screens.len() {
+            warn!(
+                "Dropping oversize spaces vector (screens={}, spaces_len={})",
                 reactor.space_manager.screens.len(),
                 spaces.len()
             );
             return;
         }
-        // Also drop any space update that reports more spaces than screens; these are
-        // transient and can reorder active workspaces across displays.
-        if spaces.len() > reactor.space_manager.screens.len() {
-            println!(
-                "[rift][space_changed] drop oversize spaces vector (screens={}, spaces_len={})",
+        // If a topology change is in-flight, ignore space updates that don't match the
+        // current screen count; wait for the matching vector before applying changes.
+        if reactor.pending_space_change_manager.topology_relayout_pending
+            && spaces.len() != reactor.space_manager.screens.len()
+        {
+            warn!(
+                "Dropping space change during topology change (screens={}, spaces_len={})",
                 reactor.space_manager.screens.len(),
                 spaces.len()
             );
@@ -283,25 +309,19 @@ impl SpaceEventHandler {
         if reactor.handle_fullscreen_space_transition(&mut spaces) {
             return;
         }
-        if matches!(
-            reactor.mission_control_manager.mission_control_state,
-            MissionControlState::Active
-        ) {
+        if reactor.is_mission_control_active() {
             // dont process whilst mc is active
             reactor.pending_space_change_manager.pending_space_change =
                 Some(PendingSpaceChange { spaces, ws_info });
             return;
         }
         let spaces_all_none = spaces.iter().all(|space| space.is_none());
-        reactor.refocus_manager.stale_cleanup_state = if spaces_all_none {
-            StaleCleanupState::Suppressed
-        } else {
-            StaleCleanupState::Enabled
-        };
         if spaces_all_none {
+            update_stale_cleanup_state(reactor, true);
             if spaces.len() == reactor.space_manager.screens.len() {
                 reactor.set_screen_spaces(&spaces);
             }
+            reactor.recompute_and_set_active_spaces(&spaces);
             return;
         }
         if spaces.len() != reactor.space_manager.screens.len() {
@@ -312,6 +332,15 @@ impl SpaceEventHandler {
             );
             return;
         }
+
+        update_stale_cleanup_state(reactor, false);
+
+        let cfg = reactor.activation_cfg();
+        let screens = reactor.screens_for_spaces(&spaces);
+        reactor.space_activation_policy.on_spaces_updated(cfg, &screens);
+
+        reactor.recompute_and_set_active_spaces(&spaces);
+
         reactor.reconcile_spaces_with_display_history(&spaces, false);
         info!("space changed");
         reactor.set_screen_spaces(&spaces);
@@ -322,9 +351,11 @@ impl SpaceEventHandler {
         if reactor.pending_space_change_manager.topology_relayout_pending {
             reactor.pending_space_change_manager.topology_relayout_pending = false;
             reactor.force_refresh_all_windows();
-            if let Err(e) = reactor.update_layout(false, false) {
-                warn!(error = ?e, "Layout update failed after topology change");
-            }
+            let _ = reactor.update_layout_or_warn_with(
+                false,
+                false,
+                "Layout update failed after topology change",
+            );
         }
     }
 
@@ -333,16 +364,60 @@ impl SpaceEventHandler {
     }
 
     pub fn handle_mission_control_native_exited(reactor: &mut Reactor) {
-        if matches!(
-            reactor.mission_control_manager.mission_control_state,
-            MissionControlState::Active
-        ) {
+        if reactor.is_mission_control_active() {
             reactor.set_mission_control_active(false);
         }
         reactor.refresh_windows_after_mission_control();
     }
+}
 
-    pub fn handle_active_spaces_changed(reactor: &mut Reactor, spaces: Vec<Option<SpaceId>>) {
-        reactor.set_active_spaces(&spaces);
+fn resolve_last_known_user_space(
+    reactor: &Reactor,
+    window_id: Option<crate::actor::app::WindowId>,
+) -> Option<SpaceId> {
+    window_id
+        .and_then(|wid| reactor.best_space_for_window_id(wid))
+        .filter(|space| crate::sys::window_server::space_is_user(space.get()))
+        .or_else(|| {
+            reactor
+                .space_manager
+                .iter_known_spaces()
+                .find(|space| crate::sys::window_server::space_is_user(space.get()))
+        })
+}
+
+fn record_fullscreen_window(
+    reactor: &mut Reactor,
+    sid: SpaceId,
+    pid: i32,
+    window_id: Option<crate::actor::app::WindowId>,
+    last_known_user_space: Option<SpaceId>,
+) {
+    let entry = match reactor.space_manager.fullscreen_by_space.entry(sid.get()) {
+        Entry::Occupied(o) => o.into_mut(),
+        Entry::Vacant(v) => v.insert(FullscreenSpaceTrack::default()),
+    };
+
+    entry.windows.push(FullscreenWindowTrack {
+        pid,
+        window_id,
+        last_known_user_space,
+        _last_seen_fullscreen_space: sid,
+    });
+}
+
+fn request_visible_windows(reactor: &Reactor, pid: i32, context: &str) {
+    if let Some(app_state) = reactor.app_manager.apps.get(&pid) {
+        if let Err(e) = app_state.handle.send(Request::GetVisibleWindows) {
+            warn!("Failed to {}: {}", context, e);
+        }
     }
+}
+
+fn update_stale_cleanup_state(reactor: &mut Reactor, spaces_all_none: bool) {
+    reactor.refocus_manager.stale_cleanup_state = if spaces_all_none {
+        StaleCleanupState::Suppressed
+    } else {
+        StaleCleanupState::Enabled
+    };
 }

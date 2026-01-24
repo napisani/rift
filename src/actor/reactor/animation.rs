@@ -156,9 +156,9 @@ impl AnimationManager {
             return false;
         };
         let mut anim = Animation::new(
-            reactor.config_manager.config.settings.animation_fps,
-            reactor.config_manager.config.settings.animation_duration,
-            reactor.config_manager.config.settings.animation_easing.clone(),
+            reactor.config.settings.animation_fps,
+            reactor.config.settings.animation_duration,
+            reactor.config.settings.animation_easing.clone(),
         );
         let mut animated_count = 0;
         let mut animated_wids_wsids: Vec<u32> = Vec::new();
@@ -183,7 +183,7 @@ impl AnimationManager {
                             continue;
                         }
                         any_frame_changed = true;
-                        let wsid = window.window_server_id.unwrap();
+                        let wsid = window.info.sys_id.unwrap();
                         let txid = reactor.transaction_manager.generate_next_txid(wsid);
                         (current_frame, Some(wsid), txid)
                     }
@@ -238,7 +238,7 @@ impl AnimationManager {
 
         if animated_count > 0 {
             let low_power = power::is_low_power_mode_enabled();
-            if is_resize || !reactor.config_manager.config.settings.animate || low_power {
+            if is_resize || !reactor.config.settings.animate || low_power {
                 anim.skip_to_end();
             } else {
                 anim.run();
@@ -300,7 +300,7 @@ impl AnimationManager {
             let mut has_txid = false;
             let mut txid_entries: Vec<(WindowServerId, TransactionId, CGRect)> = Vec::new();
             if let Some(window) = reactor.window_manager.windows.get_mut(&first_wid) {
-                if let Some(wsid) = window.window_server_id {
+                if let Some(wsid) = window.info.sys_id {
                     txid = reactor.transaction_manager.generate_next_txid(wsid);
                     has_txid = true;
                     txid_entries.push((wsid, txid, first_target));
@@ -310,7 +310,7 @@ impl AnimationManager {
             if has_txid {
                 for (wid, frame) in frames.iter().skip(1) {
                     if let Some(w) = reactor.window_manager.windows.get_mut(wid) {
-                        if let Some(wsid) = w.window_server_id {
+                        if let Some(wsid) = w.info.sys_id {
                             reactor.transaction_manager.set_last_sent_txid(wsid, txid);
                             txid_entries.push((wsid, txid, *frame));
                         }

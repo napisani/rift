@@ -36,7 +36,13 @@ impl TraditionalLayoutSystem {
             return None;
         }
 
-        if let Some(selected) = self.tree.data.selection.local_selection(self.map(), node) {
+        if let Some(selected) = self
+            .tree
+            .data
+            .selection
+            .local_selection(self.map(), node)
+            .or_else(|| self.tree.data.selection.last_selection(self.map(), node))
+        {
             if let Some(target) = self.find_best_focus_target(selected) {
                 return Some(target);
             }
@@ -464,11 +470,6 @@ impl LayoutSystem for TraditionalLayoutSystem {
             for (node, parent) in focus_node.ancestors_with_parent(map) {
                 let Some(parent) = parent else { break };
                 let parent_layout = self.layout(parent);
-                if parent_layout.is_stacked()
-                    && parent_layout.orientation() != direction.orientation()
-                {
-                    continue;
-                }
                 if self.tree.data.selection.select_locally(map, node) {
                     if parent_layout.is_group() {
                         highest_revealed = node;
@@ -1070,6 +1071,16 @@ impl TraditionalLayoutSystem {
                     frame: rect,
                     total_count: children.len(),
                     selected_index: ui_selected_index,
+                    window_ids: {
+                        let mut ids = children
+                            .iter()
+                            .filter_map(|&child| self.window_at(child))
+                            .collect::<Vec<_>>();
+                        if matches!(kind, VerticalStack) {
+                            ids.reverse();
+                        }
+                        ids
+                    },
                 });
 
                 let mut container_rect = rect;
@@ -1558,44 +1569,51 @@ impl TraditionalLayoutSystem {
             let mut count = 0;
             let mut first_direction: Option<Direction> = None;
             let mut good = true;
-            let deltas = [
-                (
-                    Direction::Left,
-                    old_frame.min().x - new_frame.min().x,
-                    screen.size.width,
-                ),
-                (
-                    Direction::Right,
-                    new_frame.max().x - old_frame.max().x,
-                    screen.size.width,
-                ),
-                (
-                    Direction::Up,
-                    old_frame.min().y - new_frame.min().y,
-                    screen.size.height,
-                ),
-                (
-                    Direction::Down,
-                    new_frame.max().y - old_frame.max().y,
-                    screen.size.height,
-                ),
-            ];
-            for (direction, delta, whole) in deltas {
-                if delta != 0.0 {
-                    count += 1;
-                    if count > 2 {
+            let left_delta = old_frame.min().x - new_frame.min().x;
+            let right_delta = new_frame.max().x - old_frame.max().x;
+            let up_delta = old_frame.min().y - new_frame.min().y;
+            let down_delta = new_frame.max().y - old_frame.max().y;
+
+            let mut effective = Vec::new();
+
+            let horiz_size = left_delta + right_delta;
+            if left_delta != 0.0 || right_delta != 0.0 {
+                if horiz_size != 0.0 {
+                    let direction = if left_delta.abs() >= right_delta.abs() {
+                        Direction::Left
+                    } else {
+                        Direction::Right
+                    };
+                    effective.push((direction, horiz_size, screen.size.width));
+                }
+            }
+
+            let vert_size = up_delta + down_delta;
+            if up_delta != 0.0 || down_delta != 0.0 {
+                if vert_size != 0.0 {
+                    let direction = if up_delta.abs() >= down_delta.abs() {
+                        Direction::Up
+                    } else {
+                        Direction::Down
+                    };
+                    effective.push((direction, vert_size, screen.size.height));
+                }
+            }
+
+            for (direction, delta, whole) in effective {
+                count += 1;
+                if count > 2 {
+                    good = false;
+                }
+                if let Some(first) = first_direction {
+                    if first.orientation() == direction.orientation() {
                         good = false;
                     }
-                    if let Some(first) = first_direction {
-                        if first.orientation() == direction.orientation() {
-                            good = false;
-                        }
-                    } else {
-                        first_direction = Some(direction);
-                    }
-                    if resize {
-                        self.resize_internal(node, f64::from(delta) / f64::from(whole), direction);
-                    }
+                } else {
+                    first_direction = Some(direction);
+                }
+                if resize {
+                    self.resize_internal(node, f64::from(delta) / f64::from(whole), direction);
                 }
             }
             good
@@ -1714,7 +1732,7 @@ impl TraditionalLayoutSystem {
 struct Components {
     selection: Selection,
     layout: Layout,
-    window: Window,
+    window: WindowIndex,
 }
 
 impl tree::Observer for Components {
@@ -1752,7 +1770,7 @@ impl tree::Observer for Components {
 }
 
 #[derive(Default, Serialize, Deserialize)]
-struct Window {
+struct WindowIndex {
     windows: slotmap::SecondaryMap<NodeId, WindowId>,
     window_nodes: crate::common::collections::BTreeMap<WindowId, WindowNodeInfoVec>,
 }
@@ -1766,7 +1784,7 @@ struct WindowNodeInfo {
 #[derive(Serialize, Deserialize, Default)]
 struct WindowNodeInfoVec(Vec<WindowNodeInfo>);
 
-impl Window {
+impl WindowIndex {
     fn at(&self, node: NodeId) -> Option<WindowId> { self.windows.get(node).copied() }
 
     fn node_for(&self, layout: LayoutId, wid: WindowId) -> Option<NodeId> {
@@ -2057,7 +2075,7 @@ impl Layout {
         }
     }
 
-    fn is_focused_in_subtree(&self, map: &NodeMap, window: &Window, node: NodeId) -> bool {
+    fn is_focused_in_subtree(&self, map: &NodeMap, window: &WindowIndex, node: NodeId) -> bool {
         if window.at(node).is_some() {
             if let Some(parent) = node.parent(map) {
                 return parent.first_child(map) == Some(node);
@@ -2074,7 +2092,7 @@ impl Layout {
     fn apply_with_gaps(
         &self,
         map: &NodeMap,
-        window: &Window,
+        window: &WindowIndex,
         node: NodeId,
         rect: CGRect,
         screen: CGRect,
@@ -2182,7 +2200,7 @@ impl Layout {
     fn layout_axis(
         &self,
         map: &NodeMap,
-        window: &Window,
+        window: &WindowIndex,
         node: NodeId,
         rect: CGRect,
         screen: CGRect,
