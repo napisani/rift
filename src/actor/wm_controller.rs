@@ -8,13 +8,13 @@ use std::path::PathBuf;
 use dispatchr::queue;
 use dispatchr::time::Time;
 use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication};
-use objc2_core_foundation::CGRect;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use strum::VariantNames;
 use tracing::{debug, error, info, instrument, warn};
 
+use crate::actor::gesture_tap;
 use crate::common::config::WorkspaceSelector;
 use crate::sys::app::{NSRunningApplicationExt, pid_t};
 
@@ -24,10 +24,11 @@ type Receiver = actor::Receiver<WmEvent>;
 
 use self::WmCmd::*;
 use crate::actor::app::AppInfo;
-use crate::actor::{self, event_tap, mission_control, reactor};
+use crate::actor::spaces::ForwardedSpaceState;
+use crate::actor::{self, config, event_tap, mission_control, reactor};
 use crate::model::tx_store::WindowTxStore;
 use crate::sys::dispatch::DispatchExt;
-use crate::sys::screen::{CoordinateConverter, ScreenInfo, SpaceId};
+use crate::sys::screen::CoordinateConverter;
 use crate::{layout_engine as layout, sys};
 
 #[derive(Debug)]
@@ -38,11 +39,7 @@ pub enum WmEvent {
     AppGloballyActivated(pid_t),
     AppGloballyDeactivated(pid_t),
     AppTerminated(pid_t),
-    DisplayChurnBegin,
-    DisplayChurnEnd,
-    SpaceChanged(Vec<Option<SpaceId>>),
-    ScreenParametersChanged(Vec<ScreenInfo>, CoordinateConverter),
-    SystemWoke,
+    SpaceStateUpdated(ForwardedSpaceState, CoordinateConverter),
     PowerStateChanged(bool),
     KeyboardLayoutChanged,
     ConfigUpdated(crate::common::config::Config),
@@ -61,6 +58,7 @@ pub enum WmCommand {
 pub enum WmCmd {
     ToggleSpaceActivated,
     Exec(ExecCmd),
+    ReloadConfig,
 
     NextWorkspace,
     PrevWorkspace,
@@ -72,6 +70,7 @@ pub enum WmCmd {
     ShowMissionControlAll,
     ShowMissionControlCurrent,
     DismissMissionControl,
+    CloseWindow,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -118,8 +117,10 @@ pub struct Config {
 
 pub struct WmController {
     config: Config,
+    config_tx: config::Sender,
     events_tx: reactor::Sender,
     event_tap_tx: event_tap::Sender,
+    gesture_tap_tx: Option<gesture_tap::Sender>,
     stack_line_tx: Option<crate::actor::stack_line::Sender>,
     mission_control_tx: Option<mission_control::Sender>,
     window_tx_store: Option<WindowTxStore>,
@@ -131,25 +132,25 @@ pub struct WmController {
 impl WmController {
     pub fn new(
         config: Config,
+        config_tx: config::Sender,
         events_tx: reactor::Sender,
         event_tap_tx: event_tap::Sender,
         stack_line_tx: crate::actor::stack_line::Sender,
         mission_control_tx: crate::actor::mission_control::Sender,
+        gesture_tap_tx: Option<gesture_tap::Sender>,
         window_tx_store: Option<WindowTxStore>,
     ) -> (Self, actor::Sender<WmEvent>) {
         let (sender, receiver) = actor::channel();
-        sys::app::set_activation_policy_callback({
-            let sender = sender.clone();
-            move |pid, info| sender.send(WmEvent::AppLaunch(pid, info))
-        });
-        sys::app::set_finished_launching_callback({
+        sys::app::set_application_callback({
             let sender = sender.clone();
             move |pid, info| sender.send(WmEvent::AppLaunch(pid, info))
         });
         let this = Self {
             config,
+            config_tx,
             events_tx,
             event_tap_tx,
+            gesture_tap_tx,
             stack_line_tx: Some(stack_line_tx),
             mission_control_tx: Some(mission_control_tx),
             window_tx_store,
@@ -181,16 +182,31 @@ impl WmController {
                 | Command(Wm(crate::actor::wm_controller::WmCmd::PrevWorkspace))
                 | Command(Wm(crate::actor::wm_controller::WmCmd::SwitchToWorkspace(_)))
                 | Command(Wm(crate::actor::wm_controller::WmCmd::SwitchToLastWorkspace))
-                | SpaceChanged(_)
+                | SpaceStateUpdated(..)
         ) && let Some(tx) = &self.mission_control_tx
         {
             tx.send(mission_control::Event::RefreshCurrentWorkspace);
         }
 
         match event {
-            SystemWoke => self.events_tx.send(Event::SystemWoke),
-            DisplayChurnBegin => self.events_tx.send(Event::DisplayChurnBegin),
-            DisplayChurnEnd => self.events_tx.send(Event::DisplayChurnEnd),
+            SpaceStateUpdated(space_state, converter) => {
+                self.events_tx.send(Event::SpaceStateChanged(space_state.clone()));
+                _ = self.event_tap_tx.send(event_tap::Request::SpaceStateUpdated(
+                    space_state.clone(),
+                    converter,
+                ));
+                if let Some(tx) = &self.gesture_tap_tx {
+                    tx.send(gesture_tap::GestureRequest::SpaceStateUpdated(
+                        space_state.clone(),
+                    ));
+                }
+                if let Some(tx) = &self.stack_line_tx {
+                    _ = tx.try_send(crate::actor::stack_line::Event::SpaceStateUpdated(
+                        converter,
+                        space_state,
+                    ));
+                }
+            }
             AppEventsRegistered => {
                 _ = self.event_tap_tx.send(event_tap::Request::SetEventProcessing(false));
 
@@ -229,9 +245,7 @@ impl WmController {
                 self.events_tx.send(Event::ApplicationGloballyDeactivated(pid));
             }
             AppTerminated(pid) => {
-                sys::app::remove_activation_policy_observer(pid);
-                sys::app::remove_finished_launching_observer(pid);
-                sys::app::clear_ready_callback_notified(pid);
+                sys::app::remove_application_observer(pid);
                 self.events_tx.send(Event::ApplicationTerminated(pid));
             }
             ConfigUpdated(new_cfg) => {
@@ -242,6 +256,11 @@ impl WmController {
                 _ = self
                     .event_tap_tx
                     .send(event_tap::Request::ConfigUpdated(self.config.config.clone()));
+                if let Some(tx) = &self.gesture_tap_tx {
+                    tx.send(gesture_tap::GestureRequest::ConfigUpdated(
+                        self.config.config.clone(),
+                    ));
+                }
 
                 if !self.hotkeys_installed {
                     debug!(
@@ -264,26 +283,6 @@ impl WmController {
                     self.register_hotkeys();
                 }
             }
-            ScreenParametersChanged(screens, converter) => {
-                let frames_with_spaces: Vec<(CGRect, Option<SpaceId>)> =
-                    screens.iter().map(|s| (s.frame, s.space)).collect();
-
-                self.events_tx.send(Event::ScreenParametersChanged(screens));
-
-                _ = self.event_tap_tx.send(event_tap::Request::ScreenParametersChanged(
-                    frames_with_spaces,
-                    converter,
-                ));
-                if let Some(tx) = &self.stack_line_tx {
-                    _ = tx.try_send(crate::actor::stack_line::Event::ScreenParametersChanged(
-                        converter,
-                    ));
-                }
-            }
-            SpaceChanged(spaces) => {
-                self.events_tx.send(reactor::Event::SpaceChanged(spaces.clone()));
-                _ = self.event_tap_tx.send(event_tap::Request::SpaceChanged(spaces));
-            }
             PowerStateChanged(is_low_power_mode) => {
                 info!("Power state changed: low power mode = {}", is_low_power_mode);
                 _ = self.event_tap_tx.send(event_tap::Request::SetLowPowerMode(is_low_power_mode));
@@ -291,6 +290,7 @@ impl WmController {
             KeyboardLayoutChanged => {
                 _ = self.event_tap_tx.send(event_tap::Request::KeyboardLayoutChanged);
             }
+            Command(Wm(ReloadConfig)) => self.reload_config(),
             Command(Wm(crate::actor::wm_controller::WmCmd::ToggleSpaceActivated)) => {
                 self.events_tx.send(reactor::Event::Command(reactor::Command::Reactor(
                     reactor::ReactorCommand::ToggleSpaceActivated,
@@ -329,31 +329,14 @@ impl WmController {
                     );
                 }
             }
-            Command(Wm(MoveWindowToWorkspace(ws_sel))) => {
-                let maybe_index: Option<usize> = match &ws_sel {
-                    WorkspaceSelector::Index(i) => Some(*i),
-                    WorkspaceSelector::Name(name) => self
-                        .config
-                        .config
-                        .virtual_workspaces
-                        .workspace_names
-                        .iter()
-                        .position(|n| n == name),
-                };
-
-                if let Some(workspace_index) = maybe_index {
-                    self.events_tx.send(reactor::Event::Command(reactor::Command::Layout(
-                        layout::LayoutCommand::MoveWindowToWorkspace {
-                            workspace: workspace_index,
-                            window_id: None,
-                        },
-                    )));
-                } else {
-                    tracing::warn!(
-                        "Hotkey requested move window to workspace {:?} but it could not be resolved; ignoring",
-                        ws_sel
-                    );
-                }
+            Command(Wm(MoveWindowToWorkspace(workspace))) => {
+                self.events_tx.send(reactor::Event::Command(reactor::Command::Layout(
+                    layout::LayoutCommand::MoveWindowToWorkspace {
+                        workspace,
+                        follow: false,
+                        window_id: None,
+                    },
+                )));
             }
             Command(Wm(CreateWorkspace)) => {
                 self.events_tx.send(reactor::Event::Command(reactor::Command::Layout(
@@ -379,6 +362,11 @@ impl WmController {
                 if let Some(tx) = &self.mission_control_tx {
                     let _ = tx.try_send(mission_control::Event::Dismiss);
                 }
+            }
+            Command(Wm(CloseWindow)) => {
+                self.events_tx.send(reactor::Event::Command(reactor::Command::Reactor(
+                    reactor::ReactorCommand::CloseWindow { window_server_id: None },
+                )));
             }
             Command(Wm(Exec(cmd))) => {
                 self.exec_cmd(cmd);
@@ -440,6 +428,23 @@ impl WmController {
         let bindings: Vec<(String, WmCommand)> =
             self.config.config.key_specs.iter().cloned().collect();
         _ = self.event_tap_tx.send(event_tap::Request::SetHotkeys(bindings));
+    }
+
+    fn reload_config(&self) {
+        let (response, _fut) = r#continue::continuation();
+        let msg = config::Event::ApplyConfig {
+            cmd: crate::common::config::ConfigCommand::ReloadConfig,
+            response,
+        };
+        if let Err(e) = self.config_tx.try_send(msg) {
+            let error_message = e.to_string();
+            let tokio::sync::mpsc::error::SendError((_span, msg)) = e;
+            match msg {
+                config::Event::ApplyConfig { response, .. } => std::mem::forget(response),
+                config::Event::QueryConfig(response) => std::mem::forget(response),
+            }
+            error!("Failed to request config reload: {error_message}");
+        }
     }
 
     fn exec_cmd(&self, cmd_args: ExecCmd) {

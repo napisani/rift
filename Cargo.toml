@@ -40,6 +40,7 @@ doctest = false
 
 [dependencies]
 anyhow = { version = "1.0.83", default-features = false }
+arc-swap = "1"
 ascii_tree = "0.1.1"
 thiserror = { version = "2.0.17", default-features = false }
 bitflags = "2.4.1"
@@ -49,6 +50,7 @@ dispatchr = { git = "https://github.com/drewcrawford/dispatchr" }
 nix = { version = "0.30.1", features = ["process", "user"] }
 objc2 = { version = "0.6.2", default-features = false, features = ["exception"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+	"NSAlert",
 	"NSAppearance",
 	"NSApplication",
 	"NSAttributedString",
@@ -64,9 +66,12 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
 	"NSImage",
 	"NSMenu",
 	"NSMenuItem",
+	"NSOpenPanel",
+	"NSPanel",
 	"NSStringDrawing",
 	"NSResponder",
 	"NSRunningApplication",
+	"NSSavePanel",
 	"NSScreen",
 	"NSStatusBar",
 	"NSStatusBarButton",
@@ -75,6 +80,8 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
 	"NSView",
 	"NSWindow",
 	"NSWorkspace",
+	"NSTextField",
+	"NSText",
 	"libc",
 	"objc2-core-foundation",
 	"objc2-core-graphics",
@@ -104,8 +111,11 @@ objc2-core-graphics = { version = "0.3.2", default-features = false, features = 
 	"CGDirectDisplay",
 	"CGError",
 	"CGEvent",
+	"CGEventSource",
 	"CGEventTypes",
+	"CGRemoteOperation",
 	"CGWindow",
+	"libc",
 	"objc2"
 ]}
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
@@ -117,6 +127,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
 	"NSKeyValueCoding",
 	"NSNotification",
 	"NSProcessInfo",
+	"NSURL",
 	"NSValue"
 ]}
 objc2-quartz-core = { version = "0.3.2", default-features = false, features = [

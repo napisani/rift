@@ -3,10 +3,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::actor::app::{AppInfo, AppThreadHandle, WindowId, pid_t};
 use crate::common::log::MetricsCommand;
-use crate::layout_engine::{Direction, LayoutCommand};
+use crate::layout_engine::{Direction, LayoutCommand, RestoreScope, RestoreSource};
+use crate::model::WindowStore;
 use crate::sys::app::WindowInfo;
 use crate::sys::screen::SpaceId;
 use crate::sys::window_server::WindowServerId;
+
+/// All mutable domain state is owned by the reactor thread.
+///
+/// Workspace topology is still carried by the layout coordinator during this
+/// migration, but window identity, native-space observations, and workspace
+/// assignments have one explicit owner here. Cross-store operations receive
+/// this store by reference instead of retaining an alias to it.
+#[derive(Debug, Default)]
+pub struct RiftState {
+    pub windows: WindowStore,
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Requested(pub bool);
@@ -32,7 +44,16 @@ pub enum DisplaySelector {
 pub enum ReactorCommand {
     Debug,
     Serialize,
+    SaveLayout {
+        path: std::path::PathBuf,
+    },
     SaveAndExit,
+    RestoreLayout {
+        path: std::path::PathBuf,
+        scope: RestoreScope,
+        #[serde(default)]
+        source: RestoreSource,
+    },
     SwitchSpace(Direction),
     ToggleSpaceActivated,
     FocusWindow {
@@ -51,23 +72,6 @@ pub enum ReactorCommand {
         selector: DisplaySelector,
         window_id: Option<u32>,
     },
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct FullscreenWindowTrack {
-    pub(crate) pid: pid_t,
-    pub(crate) window_id: Option<WindowId>,
-    pub(crate) last_known_user_space: Option<SpaceId>,
-    pub(crate) _last_seen_fullscreen_space: SpaceId,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct FullscreenSpaceTrack {
-    pub(crate) windows: Vec<FullscreenWindowTrack>,
-}
-
-impl Default for FullscreenSpaceTrack {
-    fn default() -> Self { FullscreenSpaceTrack { windows: Vec::new() } }
 }
 
 #[derive(Debug, Clone)]
@@ -135,11 +139,6 @@ pub(crate) struct AppState {
     pub(crate) handle: AppThreadHandle,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct PendingSpaceChange {
-    pub(crate) spaces: Vec<Option<SpaceId>>,
-}
-
 #[derive(Debug)]
 pub(crate) struct WindowState {
     pub(crate) info: WindowInfo,
@@ -196,4 +195,32 @@ pub enum ReactorError {
     RaiseManagerCommunicationFailed(
         #[from] tokio::sync::mpsc::error::SendError<crate::actor::raise_manager::Event>,
     ),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_restore_command_defaults_to_portable_source_policy() {
+        let mut serialized = serde_json::to_value(ReactorCommand::RestoreLayout {
+            path: "layout.ron".into(),
+            scope: RestoreScope::Workspace,
+            source: RestoreSource::CurrentSpace,
+        })
+        .unwrap();
+        serialized
+            .get_mut("restore_layout")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("source");
+
+        let restored: ReactorCommand = serde_json::from_value(serialized).unwrap();
+
+        assert_eq!(restored, ReactorCommand::RestoreLayout {
+            path: "layout.ron".into(),
+            scope: RestoreScope::Workspace,
+            source: RestoreSource::SavedActiveSpace,
+        });
+    }
 }

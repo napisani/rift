@@ -1,10 +1,11 @@
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::{self};
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use rift_wm::actor::app::WindowId;
 use rift_wm::actor::reactor::{self, DisplaySelector};
-use rift_wm::common::config::LayoutMode;
+use rift_wm::common::config::{LayoutMode, WorkspaceSelector};
 use rift_wm::ipc::{RiftCommand, RiftMachClient, RiftRequest, RiftResponse};
 use rift_wm::layout_engine as layout;
 use rift_wm::sys::window_server::WindowServerId;
@@ -119,18 +120,36 @@ enum ExecuteCommands {
         #[command(subcommand)]
         display_cmd: DisplayCommands,
     },
-    /// macOS space management commands
+    /// macOS space commands (Mission Control spaces, not virtual workspaces)
     Space {
         #[command(subcommand)]
         space_cmd: SpaceCommands,
     },
-    /// Save current state and exit rift
+    /// Save the master file and exit Rift
     SaveAndExit,
+    /// Save Rift's current layout state without exiting
+    ///
+    /// Use --master instead of PATH to update Rift's master file.
+    SaveLayout {
+        #[command(flatten)]
+        file: LayoutFileSelection,
+    },
+    /// Restore a layout file to the current workspace or macOS Space
+    ///
+    /// Use --master instead of PATH to load Rift's master file.
+    LoadLayout {
+        #[command(flatten)]
+        file: LayoutFileSelection,
+        /// Restore one workspace or all saved workspaces for the current macOS Space.
+        #[arg(long, value_enum, default_value_t = CliRestoreScope::Workspace)]
+        scope: CliRestoreScope,
+    },
     /// Print layout tree debugging output in the running rift instance
     Debug,
     /// Serialize and print runtime state
     Serialize,
-    /// Toggle whether the current space is managed by rift
+    /// this command is deprecated, use `rift-cli execute space toggle-activated`
+    #[deprecated]
     ToggleSpaceActivated,
     /// Show timing metrics
     ShowTiming,
@@ -142,14 +161,14 @@ enum WindowCommands {
     Next,
     /// Focus the previous window
     Prev,
-    /// Focus a window by direction or by specific window ID
+    /// Focus a window by direction or by a specific window ID
     #[command(group = clap::ArgGroup::new("focus-target").required(true).multiple(false))]
     Focus {
         /// Direction to move focus (up, down, left, right)
         #[arg(long, group = "focus-target")]
         direction: Option<String>,
 
-        /// Internal window ID in pid:idx format (e.g., "1234:0")
+        /// Internal window ID in pid:idx format (e.g., "1234:0") or JSON
         #[arg(long, group = "focus-target")]
         window_id: Option<String>,
 
@@ -164,9 +183,17 @@ enum WindowCommands {
     /// Toggle fullscreen within configured outer gaps (respects outer gaps / fills tiling area)
     ToggleFullscreenWithinGaps,
     /// Grow the current window size (increments by ~5%).
-    ResizeGrow,
+    ResizeGrow {
+        /// Axis to resize; smart chooses the nearest applicable split.
+        #[arg(long, value_enum, default_value_t = CliResizeOrientation::Horizontal)]
+        orientation: CliResizeOrientation,
+    },
     /// Shrink the current window size (decrements by ~5%).
-    ResizeShrink,
+    ResizeShrink {
+        /// Axis to resize; smart chooses the nearest applicable split.
+        #[arg(long, value_enum, default_value_t = CliResizeOrientation::Horizontal)]
+        orientation: CliResizeOrientation,
+    },
     /// Resize the selected window by a fractional amount.
     /// - Pass a signed floating value: positive to grow, negative to shrink.
     /// - The value is a fraction of the current size (e.g. `0.05` = 5%).
@@ -174,11 +201,56 @@ enum WindowCommands {
     ///   rift-cli execute window resize-by --amount 0.05    # grow by 5%
     ///   rift-cli execute window resize-by --amount -0.10   # shrink by 10%
     ResizeBy { amount: f64 },
-    /// Close a window by window server identifier
+    /// Close a window as if Command-W was pressed
     Close {
-        /// Window Id (window server id or idx from window id)
-        #[arg(long)]
-        window_id: String,
+        /// Optional window server ID; defaults to the focused window
+        #[arg(long, visible_alias = "window-server-id")]
+        window_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliRestoreScope {
+    Workspace,
+    Space,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliResizeOrientation {
+    Horizontal,
+    Vertical,
+    Smart,
+}
+
+impl From<CliResizeOrientation> for rift_wm::layout_engine::ResizeOrientation {
+    fn from(value: CliResizeOrientation) -> Self {
+        match value {
+            CliResizeOrientation::Horizontal => Self::Horizontal,
+            CliResizeOrientation::Vertical => Self::Vertical,
+            CliResizeOrientation::Smart => Self::Smart,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Args)]
+#[group(required = true, multiple = false)]
+struct LayoutFileSelection {
+    /// Layout file path.
+    #[arg(value_name = "PATH")]
+    path: Option<PathBuf>,
+    /// Use Rift's master file (~/.rift/layout.ron).
+    #[arg(long)]
+    master: bool,
+}
+
+#[derive(Subcommand)]
+enum SpaceCommands {
+    /// Toggle whether rift manages the current macOS space
+    ToggleActivated,
+    /// Switch to an adjacent macOS space (Mission Control spaces, not virtual workspaces)
+    Switch {
+        /// Direction to switch (left, right, up, down)
+        direction: String,
     },
 }
 
@@ -193,6 +265,9 @@ enum WorkspaceCommands {
     /// Move current window to workspace
     MoveWindow {
         workspace_id: usize,
+        /// Switch to the destination workspace after moving the window.
+        #[arg(long)]
+        follow: bool,
         window_id: Option<u32>,
     },
     /// Create a new workspace
@@ -219,6 +294,8 @@ enum LayoutCommands {
     MoveNode { direction: String },
     /// Join the selected window with neighbor in a direction
     JoinWindow { direction: String },
+    /// Join with a neighbor, or unjoin when the selected window is already joined
+    ConsumeOrExpelWindow { direction: String },
     /// Toggle stacked state for the selected container
     ToggleStack,
     /// Global orientation toggle that works consistently across layout modes (and between splits/stacks)
@@ -536,15 +613,54 @@ fn build_execute_request(execute: ExecuteCommands) -> Result<RiftRequest, String
         ExecuteCommands::SaveAndExit => {
             RiftCommand::Reactor(reactor::Command::Reactor(reactor::ReactorCommand::SaveAndExit))
         }
+        ExecuteCommands::SaveLayout { file } => {
+            let path = if file.master {
+                rift_wm::common::config::restore_file()
+            } else {
+                absolute_layout_path(file.path.expect("clap requires either PATH or --master"))?
+            };
+            RiftCommand::Reactor(reactor::Command::Reactor(reactor::ReactorCommand::SaveLayout {
+                path,
+            }))
+        }
+        ExecuteCommands::LoadLayout { file, scope } => {
+            let (path, source) = if file.master {
+                (
+                    rift_wm::common::config::restore_file(),
+                    layout::RestoreSource::CurrentSpace,
+                )
+            } else {
+                (
+                    absolute_layout_path(
+                        file.path.expect("clap requires either PATH or --master"),
+                    )?,
+                    layout::RestoreSource::SavedActiveSpace,
+                )
+            };
+            layout::LayoutEngine::load(path.clone()).map_err(|error| {
+                format!("could not load layout file at {}: {error}", path.display())
+            })?;
+            let scope = match scope {
+                CliRestoreScope::Workspace => layout::RestoreScope::Workspace,
+                CliRestoreScope::Space => layout::RestoreScope::Space,
+            };
+            RiftCommand::Reactor(reactor::Command::Reactor(
+                reactor::ReactorCommand::RestoreLayout { path, scope, source },
+            ))
+        }
         ExecuteCommands::Debug => {
             RiftCommand::Reactor(reactor::Command::Reactor(reactor::ReactorCommand::Debug))
         }
         ExecuteCommands::Serialize => {
             RiftCommand::Reactor(reactor::Command::Reactor(reactor::ReactorCommand::Serialize))
         }
-        ExecuteCommands::ToggleSpaceActivated => RiftCommand::Reactor(reactor::Command::Reactor(
-            reactor::ReactorCommand::ToggleSpaceActivated,
-        )),
+        #[allow(deprecated)]
+        ExecuteCommands::ToggleSpaceActivated => {
+            eprintln!("this command is deprecated, use rift-cli execute space toggle-activated");
+            RiftCommand::Reactor(reactor::Command::Reactor(
+                reactor::ReactorCommand::ToggleSpaceActivated,
+            ))
+        }
         ExecuteCommands::ShowTiming => RiftCommand::Reactor(reactor::Command::Metrics(
             rift_wm::common::log::MetricsCommand::ShowTiming,
         )),
@@ -575,6 +691,16 @@ fn build_execute_request(execute: ExecuteCommands) -> Result<RiftRequest, String
             command: command_str,
             args: vec![],
         })
+    }
+}
+
+fn absolute_layout_path(path: PathBuf) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        std::env::current_dir()
+            .map(|current_dir| current_dir.join(path))
+            .map_err(|error| format!("could not resolve layout path: {error}"))
     }
 }
 
@@ -616,19 +742,19 @@ fn map_window_command(cmd: WindowCommands) -> Result<RiftCommand, String> {
         WindowCommands::ToggleFullscreenWithinGaps => Ok(RiftCommand::Reactor(
             reactor::Command::Layout(LC::ToggleFullscreenWithinGaps),
         )),
-        WindowCommands::ResizeGrow => Ok(RiftCommand::Reactor(reactor::Command::Layout(
-            LC::ResizeWindowGrow,
-        ))),
-        WindowCommands::ResizeShrink => Ok(RiftCommand::Reactor(reactor::Command::Layout(
-            LC::ResizeWindowShrink,
-        ))),
+        WindowCommands::ResizeGrow { orientation } => Ok(RiftCommand::Reactor(
+            reactor::Command::Layout(LC::ResizeWindowGrow(orientation.into())),
+        )),
+        WindowCommands::ResizeShrink { orientation } => Ok(RiftCommand::Reactor(
+            reactor::Command::Layout(LC::ResizeWindowShrink(orientation.into())),
+        )),
         WindowCommands::ResizeBy { amount } => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::ResizeWindowBy { amount },
         ))),
         WindowCommands::Close { window_id } => {
-            let wsid = parse_window_server_id(&window_id)?;
+            let window_server_id = window_id.as_deref().map(parse_window_server_id).transpose()?;
             Ok(RiftCommand::Reactor(reactor::Command::Reactor(
-                reactor::ReactorCommand::CloseWindow { window_server_id: Some(wsid) },
+                reactor::ReactorCommand::CloseWindow { window_server_id },
             )))
         }
     }
@@ -705,12 +831,17 @@ fn map_workspace_command(cmd: WorkspaceCommands) -> Result<RiftCommand, String> 
         WorkspaceCommands::Switch { workspace_id } => Ok(RiftCommand::Reactor(
             reactor::Command::Layout(LC::SwitchToWorkspace(workspace_id)),
         )),
-        WorkspaceCommands::MoveWindow { workspace_id, window_id } => Ok(RiftCommand::Reactor(
-            reactor::Command::Layout(LC::MoveWindowToWorkspace {
-                workspace: workspace_id,
+        WorkspaceCommands::MoveWindow {
+            workspace_id,
+            follow,
+            window_id,
+        } => Ok(RiftCommand::Reactor(reactor::Command::Layout(
+            LC::MoveWindowToWorkspace {
+                workspace: WorkspaceSelector::Index(workspace_id),
+                follow,
                 window_id,
-            }),
-        )),
+            },
+        ))),
         WorkspaceCommands::Create => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::CreateWorkspace,
         ))),
@@ -737,6 +868,9 @@ fn map_layout_command(cmd: LayoutCommands) -> Result<RiftCommand, String> {
         LayoutCommands::JoinWindow { direction } => Ok(RiftCommand::Reactor(
             reactor::Command::Layout(LC::JoinWindow(direction.into())),
         )),
+        LayoutCommands::ConsumeOrExpelWindow { direction } => Ok(RiftCommand::Reactor(
+            reactor::Command::Layout(LC::ConsumeOrExpelWindow(direction.into())),
+        )),
         LayoutCommands::ToggleStack => {
             Ok(RiftCommand::Reactor(reactor::Command::Layout(LC::ToggleStack)))
         }
@@ -750,7 +884,7 @@ fn map_layout_command(cmd: LayoutCommands) -> Result<RiftCommand, String> {
             LC::ToggleFocusFloating,
         ))),
         LayoutCommands::AdjustMasterRatio { delta } => Ok(RiftCommand::Reactor(
-            reactor::Command::Layout(LC::AdjustMasterRatio { delta }),
+            reactor::Command::Layout(LC::AdjustMasterRatio(delta)),
         )),
         LayoutCommands::AdjustMasterCount { delta } => Ok(RiftCommand::Reactor(
             reactor::Command::Layout(LC::AdjustMasterCount { delta }),
@@ -874,6 +1008,17 @@ fn map_mission_control_command(cmd: MissionControlCommands) -> Result<RiftComman
             reactor::ReactorCommand::DismissMissionControl,
         ))),
     }
+}
+
+fn map_space_command(cmd: SpaceCommands) -> Result<RiftCommand, String> {
+    let command = match cmd {
+        SpaceCommands::ToggleActivated => reactor::ReactorCommand::ToggleSpaceActivated,
+        SpaceCommands::Switch { direction } => {
+            reactor::ReactorCommand::SwitchSpace(parse_focus_direction(&direction)?)
+        }
+    };
+
+    Ok(RiftCommand::Reactor(reactor::Command::Reactor(command)))
 }
 
 fn map_display_command(cmd: DisplayCommands) -> Result<RiftCommand, String> {

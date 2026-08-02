@@ -1,56 +1,58 @@
-use std::cell::RefCell;
-use std::mem::replace;
-use std::panic::AssertUnwindSafe;
-use std::rc::Rc;
-use std::str::FromStr;
+//! Input processing via a CGEventTap on a dedicated thread.
+//!
+//! The `EventTap` (aka input processor) owns a `Default`-mode CGEventTap and
+//! runs its own CFRunLoop on a dedicated thread (`input` thread). This isolates
+//! keyboard/mouse input processing from main-thread stalls (layout computation,
+//! animation, WindowServer IPC).
+//!
+//! Shared state between the input thread and the main thread uses lock-free
+//! `Arc<ArcSwap<T>>` primitives:
+//! - `SharedHotkeyTable`: hotkey bindings, written by the input thread on
+//!   config/layout changes, read by the callback.
+//! - `SharedHitRects`: stack-line indicator frames, written by the main-thread
+//!   `StackLine` actor, read by the callback.
+//!
+//! Requests from the main thread arrive via the actor channel (`Receiver`).
+//! The main thread's `GestureTap` is a separate `ListenOnly` tap for gestures.
 
-use objc2::exception;
-use objc2_app_kit::{
-    NSEvent, NSEventPhase, NSEventType, NSMainMenuWindowLevel, NSPopUpMenuWindowLevel,
-    NSTouchPhase, NSTouchType, NSWindowLevel,
-};
+use std::cell::{Cell, RefCell};
+use std::panic::AssertUnwindSafe;
+use std::str::FromStr;
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 use objc2_core_foundation::{CGPoint, CGRect};
 use objc2_core_graphics::{
-    CGEvent, CGEventField, CGEventFlags, CGEventMask, CGEventTapOptions as CGTapOpt,
-    CGEventTapProxy, CGEventType,
+    CGEvent, CGEventField, CGEventFlags, CGEventMask, CGEventSource, CGEventSourceStateID,
+    CGEventTapOptions as CGTapOpt, CGEventTapProxy, CGEventType,
 };
 use tracing::{debug, error, trace, warn};
 
 use super::reactor::{self, Event};
 use super::stack_line;
 use crate::actor;
+use crate::actor::spaces::ForwardedSpaceState;
 use crate::actor::wm_controller::{self, WmCommand, WmEvent};
 use crate::common::collections::{HashMap, HashSet};
-use crate::common::config::{Config, HapticPattern, LayoutMode};
-use crate::common::log::trace_misc;
-use crate::layout_engine::LayoutCommand as LC;
+use crate::common::config::{Config, LayoutMode, StackLineHoverMode};
 use crate::sys::event::{self, Hotkey, KeyCode, MouseState, set_mouse_state};
-use crate::sys::geometry::CGRectExt;
 use crate::sys::hotkey::{
-    Modifiers, is_modifier_key, key_code_from_event, modifier_flag_for_key,
+    Modifiers, is_modifier_key, key_code_from_event, modifier_key_is_active,
     modifiers_from_flags_with_keys,
 };
 use crate::sys::screen::{CoordinateConverter, SpaceId};
-use crate::sys::window_server::{self, WindowServerId, window_level};
-use crate::sys::{haptics, power};
+use crate::sys::window_server::WindowServerId;
+use crate::sys::{power, window_server};
 use crate::ui::stack_line::point_hits_indicator_frame;
 
-// Window levels can change for transient UI windows; cache briefly to reduce
-// query overhead without pinning stale values for long.
-const WINDOW_LEVEL_CACHE_TTL_NS: u64 = 300_000_000; // 300ms
-const WINDOW_LEVEL_CACHE_PRUNE_INTERVAL_NS: u64 = 1_000_000_000; // 1s
-const WINDOW_LEVEL_CACHE_MAX_ENTRIES: usize = 512;
 const MOUSE_MOVE_MIN_INTERVAL_NS_NORMAL: u64 = 8_000_000; // 8ms ~= 125 Hz
-const MOUSE_MOVE_MIN_DISTANCE_PX_SQ_NORMAL: f64 = 4.0; // 2px^2
 const MOUSE_MOVE_MIN_INTERVAL_NS_LOW_POWER: u64 = 16_000_000; // 16ms ~= 62 Hz
-const MOUSE_MOVE_MIN_DISTANCE_PX_SQ_LOW_POWER: f64 = 9.0; // 3px^2
 
 #[derive(Debug)]
 pub enum Request {
     Warp(CGPoint),
     EnforceHidden,
-    ScreenParametersChanged(Vec<(CGRect, Option<SpaceId>)>, CoordinateConverter),
-    SpaceChanged(Vec<Option<SpaceId>>),
+    SpaceStateUpdated(ForwardedSpaceState, CoordinateConverter),
     SetEventProcessing(bool),
     SetFocusFollowsMouseEnabled(bool),
     SetHotkeys(Vec<(String, WmCommand)>),
@@ -61,25 +63,31 @@ pub enum Request {
 }
 
 pub struct EventTap {
-    config: RefCell<Config>,
     events_tx: reactor::Sender,
     requests_rx: Option<Receiver>,
     state: RefCell<State>,
-    event_mask: RefCell<CGEventMask>,
+    event_mask: Cell<CGEventMask>,
+    mouse_move_last_timestamp: Cell<Option<u64>>,
+    mouse_move_min_interval_ns: Cell<u64>,
+    mouse_window: Cell<MouseWindow>,
     tap: RefCell<Option<crate::sys::event_tap::EventTap>>,
+    tap_generation: Cell<u64>,
     disable_hotkey: RefCell<Option<Hotkey>>,
-    swipe: RefCell<Option<SwipeHandler>>,
-    scroll: RefCell<Option<ScrollHandler>>,
     hotkey_specs: RefCell<Vec<(String, WmCommand)>>,
-    hotkeys: RefCell<HashMap<Hotkey, Vec<WmCommand>>>,
-    wm_sender: Option<wm_controller::Sender>,
-    stack_line_tx: Option<stack_line::Sender>,
-    stack_line_hit_rects: Option<stack_line::SharedHitRects>,
+    hotkeys: SharedHotkeyTable,
+    wm_sender: wm_controller::Sender,
+    stack_line_tx: stack_line::Sender,
+    stack_line_hit_rects: stack_line::SharedHitRects,
 }
 
+// SAFETY: EventTap is constructed on the input thread and all access occurs on
+// that same thread (CFRunLoop callback + channel recv both run on the input
+// thread's run loop). The Send impl is required only to move the struct across
+// the thread::spawn boundary.
+unsafe impl Send for EventTap {}
+
 struct State {
-    hidden: bool,
-    above_window: (Option<WindowServerId>, NSWindowLevel),
+    hide_count: u32,
     mouse_hides_on_focus: bool,
     focus_follows_mouse_config_enabled: bool,
     default_layout_mode: LayoutMode,
@@ -88,29 +96,27 @@ struct State {
     event_processing_enabled: bool,
     focus_follows_mouse_enabled: bool,
     stack_line_enabled: bool,
+    stack_line_hover_mode: StackLineHoverMode,
     disable_hotkey_active: bool,
     low_power_mode: bool,
     pressed_keys: HashSet<KeyCode>,
     current_flags: CGEventFlags,
     screen_spaces: Vec<(CGRect, SpaceId)>,
     layout_mode_by_space: HashMap<SpaceId, crate::common::config::LayoutMode>,
-    last_mouse_move_loc: Option<CGPoint>,
-    last_mouse_move_timestamp: u64,
-    window_level_cache: HashMap<WindowServerId, CachedWindowLevel>,
-    window_level_cache_last_prune_at: u64,
+    last_stack_line_hit: Option<bool>,
 }
 
-#[derive(Debug, Copy, Clone)]
-struct CachedWindowLevel {
-    level: NSWindowLevel,
-    observed_at: u64,
+#[derive(Clone, Copy, Default)]
+struct MouseWindow {
+    hint: Option<WindowServerId>,
+    resolved: Option<WindowServerId>,
+    valid: bool,
 }
 
 impl Default for State {
     fn default() -> Self {
         Self {
-            hidden: false,
-            above_window: (None, NSWindowLevel::MIN),
+            hide_count: 0,
             mouse_hides_on_focus: false,
             focus_follows_mouse_config_enabled: false,
             default_layout_mode: LayoutMode::Traditional,
@@ -119,16 +125,14 @@ impl Default for State {
             event_processing_enabled: false,
             focus_follows_mouse_enabled: true,
             stack_line_enabled: false,
+            stack_line_hover_mode: StackLineHoverMode::default(),
             disable_hotkey_active: false,
             low_power_mode: power::is_low_power_mode_enabled(),
             pressed_keys: HashSet::default(),
             current_flags: CGEventFlags::empty(),
             screen_spaces: Vec::new(),
             layout_mode_by_space: HashMap::default(),
-            last_mouse_move_loc: None,
-            last_mouse_move_timestamp: 0,
-            window_level_cache: HashMap::default(),
-            window_level_cache_last_prune_at: 0,
+            last_stack_line_hit: None,
         }
     }
 }
@@ -136,126 +140,17 @@ impl Default for State {
 pub type Sender = actor::Sender<Request>;
 pub type Receiver = actor::Receiver<Request>;
 
+pub type SharedHotkeyTable = Arc<ArcSwap<HashMap<Hotkey, Vec<WmCommand>>>>;
+
 struct CallbackCtx {
-    this: Rc<EventTap>,
+    this: Arc<EventTap>,
+    recovery_tx: tokio::sync::mpsc::UnboundedSender<Recovery>,
+    tap_generation: u64,
 }
 
-#[derive(Debug, Clone)]
-struct SwipeConfig {
-    enabled: bool,
-    invert_horizontal: bool,
-    vertical_tolerance: f64,
-    skip_empty_workspaces: Option<bool>,
-    fingers: usize,
-    distance_pct: f64,
-    haptics_enabled: bool,
-    haptic_pattern: HapticPattern,
-}
-
-impl SwipeConfig {
-    fn from_config(config: &Config) -> Self {
-        let g = &config.settings.gestures;
-        let vt_norm = if g.swipe_vertical_tolerance > 1.0 && g.swipe_vertical_tolerance <= 100.0 {
-            (g.swipe_vertical_tolerance / 100.0).clamp(0.0, 1.0)
-        } else if g.swipe_vertical_tolerance > 100.0 {
-            1.0
-        } else {
-            g.swipe_vertical_tolerance.max(0.0).min(1.0)
-        };
-        SwipeConfig {
-            enabled: g.enabled,
-            invert_horizontal: g.invert_horizontal_swipe,
-            vertical_tolerance: vt_norm,
-            skip_empty_workspaces: if g.skip_empty { Some(true) } else { None },
-            fingers: g.fingers.max(1),
-            distance_pct: g.distance_pct.clamp(0.01, 1.0),
-            haptics_enabled: g.haptics_enabled,
-            haptic_pattern: g.haptic_pattern,
-        }
-    }
-}
-
-#[derive(Default, Debug)]
-struct SwipeState {
-    phase: GesturePhase,
-    start_x: f64,
-    start_y: f64,
-}
-
-impl SwipeState {
-    fn reset(&mut self) {
-        self.phase = GesturePhase::Idle;
-        self.start_x = 0.0;
-        self.start_y = 0.0;
-    }
-}
-
-#[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
-enum GesturePhase {
-    #[default]
-    Idle,
-    Armed,
-    Committed,
-}
-
-struct SwipeHandler {
-    cfg: SwipeConfig,
-    state: RefCell<SwipeState>,
-}
-
-#[derive(Debug, Clone)]
-struct ScrollConfig {
-    enabled: bool,
-    invert_horizontal: bool,
-    vertical_tolerance: f64,
-    fingers: usize,
-    distance_pct: f64,
-}
-
-impl ScrollConfig {
-    fn from_config(config: &Config) -> Self {
-        let g = &config.settings.layout.scrolling.gestures;
-        let vt_norm = if g.vertical_tolerance > 1.0 && g.vertical_tolerance <= 100.0 {
-            (g.vertical_tolerance / 100.0).clamp(0.0, 1.0)
-        } else if g.vertical_tolerance > 100.0 {
-            1.0
-        } else {
-            g.vertical_tolerance.max(0.0).min(1.0)
-        };
-        ScrollConfig {
-            enabled: g.enabled,
-            invert_horizontal: g.invert_horizontal,
-            vertical_tolerance: vt_norm,
-            fingers: g.fingers.max(1),
-            distance_pct: g.distance_pct.clamp(0.01, 1.0),
-        }
-    }
-}
-
-#[derive(Default, Debug)]
-struct ScrollState {
-    phase: GesturePhase,
-    start_x: f64,
-    start_y: f64,
-    last_x: f64,
-    last_y: f64,
-    accum_dx: f64,
-}
-
-impl ScrollState {
-    fn reset(&mut self) {
-        self.phase = GesturePhase::Idle;
-        self.start_x = 0.0;
-        self.start_y = 0.0;
-        self.last_x = 0.0;
-        self.last_y = 0.0;
-        self.accum_dx = 0.0;
-    }
-}
-
-struct ScrollHandler {
-    cfg: ScrollConfig,
-    state: RefCell<ScrollState>,
+#[derive(Clone, Copy, Debug)]
+enum Recovery {
+    TapInvalidated(u64),
 }
 
 unsafe fn drop_mouse_ctx(ptr: *mut std::ffi::c_void) {
@@ -264,55 +159,15 @@ unsafe fn drop_mouse_ctx(ptr: *mut std::ffi::c_void) {
 
 impl EventTap {
     #[inline]
-    fn stack_line_hover_enabled(&self, state: &State) -> bool {
-        state.stack_line_enabled && self.stack_line_tx.is_some()
-    }
+    fn stack_line_hover_enabled(&self, state: &State) -> bool { state.stack_line_enabled }
 
     #[inline]
     fn focus_follows_mouse_handler_enabled(state: &State) -> bool {
         state.focus_follows_mouse_config_enabled && state.focus_follows_mouse_enabled
     }
 
-    fn build_gesture_handlers(
-        config: &Config,
-        has_wm: bool,
-    ) -> (Option<SwipeHandler>, Option<ScrollHandler>) {
-        let swipe_cfg = SwipeConfig::from_config(config);
-        let swipe = if swipe_cfg.enabled && has_wm {
-            Some(SwipeHandler {
-                cfg: swipe_cfg,
-                state: RefCell::new(SwipeState::default()),
-            })
-        } else {
-            None
-        };
-
-        let scroll_cfg = ScrollConfig::from_config(config);
-        let scroll = if scroll_cfg.enabled && has_wm {
-            Some(ScrollHandler {
-                cfg: scroll_cfg,
-                state: RefCell::new(ScrollState::default()),
-            })
-        } else {
-            None
-        };
-
-        (swipe, scroll)
-    }
-
-    fn update_gesture_handlers(&self) {
-        let config = self.config.borrow();
-        let (swipe, scroll) = Self::build_gesture_handlers(&config, self.wm_sender.is_some());
-        *self.swipe.borrow_mut() = swipe;
-        *self.scroll.borrow_mut() = scroll;
-    }
-
-    fn gesture_handlers_enabled(&self) -> bool {
-        self.swipe.borrow().is_some() || self.scroll.borrow().is_some()
-    }
-
     fn keyboard_handlers_enabled(&self) -> bool {
-        self.disable_hotkey.borrow().is_some() || !self.hotkeys.borrow().is_empty()
+        self.disable_hotkey.borrow().is_some() || !self.hotkeys.load().is_empty()
     }
 
     fn mouse_move_handlers_enabled(&self) -> bool {
@@ -324,26 +179,33 @@ impl EventTap {
 
     fn desired_event_mask(&self) -> CGEventMask {
         build_event_mask(
-            self.gesture_handlers_enabled(),
             self.keyboard_handlers_enabled(),
             self.mouse_move_handlers_enabled(),
         )
     }
 
     fn create_tap_with_mask(
-        self: &Rc<Self>,
+        self: &Arc<Self>,
         mask: CGEventMask,
+        recovery_tx: tokio::sync::mpsc::UnboundedSender<Recovery>,
     ) -> Option<crate::sys::event_tap::EventTap> {
-        let ctx = Box::new(CallbackCtx { this: Rc::clone(self) });
+        let tap_generation = self.tap_generation.get().wrapping_add(1);
+        let ctx = Box::new(CallbackCtx {
+            this: Arc::clone(self),
+            recovery_tx,
+            tap_generation,
+        });
         let ctx_ptr = Box::into_raw(ctx) as *mut std::ffi::c_void;
 
         let tap = unsafe {
-            crate::sys::event_tap::EventTap::new_with_options(
+            crate::sys::event_tap::EventTap::new_with_options_and_recovery_callbacks(
                 CGTapOpt::Default,
                 mask,
                 Some(mouse_callback),
                 ctx_ptr,
                 Some(drop_mouse_ctx),
+                Some(event_tap_reenabled),
+                Some(event_tap_invalidated),
             )
         };
 
@@ -351,68 +213,95 @@ impl EventTap {
             unsafe { drop(Box::from_raw(ctx_ptr as *mut CallbackCtx)) };
         }
 
+        if tap.is_some() {
+            self.tap_generation.set(tap_generation);
+        }
         tap
     }
 
-    fn rebuild_event_tap_mask_if_needed(self: &Rc<Self>) {
+    fn rebuild_event_tap_mask_if_needed(
+        self: &Arc<Self>,
+        recovery_tx: &tokio::sync::mpsc::UnboundedSender<Recovery>,
+    ) {
         let next_mask = self.desired_event_mask();
-        let current_mask = *self.event_mask.borrow();
-        if next_mask == current_mask {
+        if next_mask == self.event_mask.get() {
             return;
         }
 
-        let Some(new_tap) = self.create_tap_with_mask(next_mask) else {
+        let Some(new_tap) = self.create_tap_with_mask(next_mask, recovery_tx.clone()) else {
             warn!("Failed to rebuild event tap with updated mask");
             return;
         };
 
         let old_tap = self.tap.borrow_mut().replace(new_tap);
         drop(old_tap);
-        *self.event_mask.borrow_mut() = next_mask;
+        self.event_mask.set(next_mask);
+    }
+
+    fn rebuild_invalidated_event_tap(
+        self: &Arc<Self>,
+        generation: u64,
+        recovery_tx: &tokio::sync::mpsc::UnboundedSender<Recovery>,
+    ) {
+        if generation != self.tap_generation.get() {
+            debug!(generation, "Ignoring invalidation from a replaced event tap");
+            return;
+        }
+
+        let mask = self.event_mask.get();
+        let Some(new_tap) = self.create_tap_with_mask(mask, recovery_tx.clone()) else {
+            error!(generation, "Failed to recreate invalidated event tap");
+            return;
+        };
+
+        let old_tap = self.tap.borrow_mut().replace(new_tap);
+        drop(old_tap);
+        self.reconcile_after_tap_reenabled();
+        warn!(generation, "Recreated invalidated event tap");
     }
 
     pub fn new(
         config: Config,
         events_tx: reactor::Sender,
         requests_rx: Receiver,
-        wm_sender: Option<wm_controller::Sender>,
-        stack_line_tx: Option<stack_line::Sender>,
-        stack_line_hit_rects: Option<stack_line::SharedHitRects>,
+        wm_sender: wm_controller::Sender,
+        stack_line_tx: stack_line::Sender,
+        stack_line_hit_rects: stack_line::SharedHitRects,
     ) -> Self {
         let disable_hotkey = config
             .settings
             .focus_follows_mouse_disable_hotkey
             .clone()
             .and_then(|spec| spec.to_hotkey());
-        let (swipe, scroll) = Self::build_gesture_handlers(&config, wm_sender.is_some());
         let mut state = State::default();
         state.mouse_hides_on_focus = config.settings.mouse_hides_on_focus;
         state.focus_follows_mouse_config_enabled = config.settings.focus_follows_mouse;
         state.stack_line_enabled = config.settings.ui.stack_line.enabled;
+        state.stack_line_hover_mode = config.settings.ui.stack_line.hover;
         state.default_layout_mode = config.settings.layout.mode;
         state.disable_hotkey_active = disable_hotkey
             .as_ref()
             .map(|target| state.compute_disable_hotkey_active(target))
             .unwrap_or(false);
         let event_mask = build_event_mask(
-            swipe.is_some() || scroll.is_some(),
             disable_hotkey.is_some(),
             state.event_processing_enabled
-                && ((state.stack_line_enabled && stack_line_tx.is_some())
-                    || Self::focus_follows_mouse_handler_enabled(&state)),
+                && (state.stack_line_enabled || Self::focus_follows_mouse_handler_enabled(&state)),
         );
+        let mouse_move_min_interval_ns = mouse_move_sampling_profile(state.low_power_mode);
         EventTap {
-            config: RefCell::new(config),
             events_tx,
             requests_rx: Some(requests_rx),
             state: RefCell::new(state),
-            event_mask: RefCell::new(event_mask),
+            event_mask: Cell::new(event_mask),
+            mouse_move_last_timestamp: Cell::new(None),
+            mouse_move_min_interval_ns: Cell::new(mouse_move_min_interval_ns),
+            mouse_window: Cell::new(MouseWindow::default()),
             tap: RefCell::new(None),
+            tap_generation: Cell::new(0),
             disable_hotkey: RefCell::new(disable_hotkey),
-            swipe: RefCell::new(swipe),
-            scroll: RefCell::new(scroll),
             hotkey_specs: RefCell::new(Vec::new()),
-            hotkeys: RefCell::new(HashMap::default()),
+            hotkeys: Arc::new(ArcSwap::from_pointee(HashMap::default())),
             wm_sender,
             stack_line_tx,
             stack_line_hit_rects,
@@ -421,11 +310,12 @@ impl EventTap {
 
     pub async fn run(mut self) {
         let mut requests_rx = self.requests_rx.take().unwrap();
+        let (recovery_tx, mut recovery_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let this = Rc::new(self);
+        let this = Arc::new(self);
 
-        let mask = *this.event_mask.borrow();
-        let tap = this.create_tap_with_mask(mask);
+        let mask = this.event_mask.get();
+        let tap = this.create_tap_with_mask(mask, recovery_tx.clone());
 
         if let Some(tap) = tap {
             *this.tap.borrow_mut() = Some(tap);
@@ -442,60 +332,64 @@ impl EventTap {
             }
         }
 
-        while let Some((span, request)) = requests_rx.recv().await {
-            let _ = span.enter();
-            this.on_request(request);
+        loop {
+            tokio::select! {
+                maybe_recovery = recovery_rx.recv() => {
+                    let Some(recovery) = maybe_recovery else { break };
+                    match recovery {
+                        Recovery::TapInvalidated(generation) => {
+                            this.rebuild_invalidated_event_tap(generation, &recovery_tx);
+                        }
+                    }
+                }
+                maybe_request = requests_rx.recv() => {
+                    let Some((span, request)) = maybe_request else { break };
+                    let _guard = span.enter();
+                    this.on_request(request, &recovery_tx);
+                }
+            }
         }
     }
 
-    fn on_request(self: &Rc<Self>, request: Request) {
+    fn on_request(
+        self: &Arc<Self>,
+        request: Request,
+        recovery_tx: &tokio::sync::mpsc::UnboundedSender<Recovery>,
+    ) {
         let mut should_rebuild_mask = false;
-        let mut should_update_gesture_handlers = false;
         let mut state = self.state.borrow_mut();
         match request {
             Request::Warp(point) => {
+                self.reset_mouse_window();
                 if let Err(e) = event::warp_mouse(point) {
                     warn!("Failed to warp mouse: {e:?}");
-                } else {
-                    state.above_window = (None, NSWindowLevel::MIN);
                 }
-                if state.mouse_hides_on_focus && !state.hidden {
+                if state.mouse_hides_on_focus && state.hide_count == 0 {
                     debug!("Hiding mouse");
-                    if let Err(e) = event::hide_mouse() {
-                        warn!("Failed to hide mouse: {e:?}");
-                    }
-                    state.hidden = true;
+                    state.hide_mouse();
                 }
             }
             Request::EnforceHidden => {
-                if state.mouse_hides_on_focus && state.hidden {
-                    if let Err(e) = event::hide_mouse() {
-                        warn!("Failed to hide mouse: {e:?}");
-                    }
+                if state.hide_count > 0 {
+                    state.hide_mouse();
                 }
             }
-            Request::ScreenParametersChanged(screens_with_spaces, converter) => {
-                state.screens = screens_with_spaces.iter().map(|(frame, _)| *frame).collect();
-                state.screen_spaces = screens_with_spaces
+            Request::SpaceStateUpdated(space_state, converter) => {
+                state.screens = space_state.screens.iter().map(|screen| screen.frame).collect();
+                state.screen_spaces = space_state
+                    .screens
                     .into_iter()
-                    .filter_map(|(frame, maybe_space)| maybe_space.map(|space| (frame, space)))
+                    .filter_map(|screen| screen.space.map(|space| (screen.frame, space)))
                     .collect();
                 state.converter = converter;
-                state.window_level_cache.clear();
-                state.window_level_cache_last_prune_at = 0;
-            }
-            Request::SpaceChanged(spaces) => {
-                state.screen_spaces = state
-                    .screens
-                    .iter()
-                    .copied()
-                    .zip(spaces.into_iter())
-                    .filter_map(|(frame, maybe_space)| maybe_space.map(|space| (frame, space)))
-                    .collect();
             }
             Request::SetEventProcessing(enabled) => {
                 state.event_processing_enabled = enabled;
                 state.reset(enabled);
+                if enabled {
+                    self.reset_mouse_move_sample_gate();
+                    self.reset_mouse_window();
+                }
                 should_rebuild_mask = true;
             }
             Request::SetFocusFollowsMouseEnabled(enabled) => {
@@ -505,6 +399,10 @@ impl EventTap {
                 );
                 state.focus_follows_mouse_enabled = enabled;
                 state.reset(enabled);
+                if enabled {
+                    self.reset_mouse_move_sample_gate();
+                    self.reset_mouse_window();
+                }
                 should_rebuild_mask = true;
             }
             Request::SetHotkeys(bindings) => {
@@ -520,19 +418,24 @@ impl EventTap {
                 let mouse_hides_on_focus = new_config.settings.mouse_hides_on_focus;
                 let focus_follows_mouse_config_enabled = new_config.settings.focus_follows_mouse;
                 let stack_line_enabled = new_config.settings.ui.stack_line.enabled;
+                let stack_line_hover_mode = new_config.settings.ui.stack_line.hover;
                 let default_layout_mode = new_config.settings.layout.mode;
                 let disable_hotkey = new_config
                     .settings
                     .focus_follows_mouse_disable_hotkey
                     .clone()
                     .and_then(|spec| spec.to_hotkey());
-                *self.config.borrow_mut() = new_config;
                 *self.disable_hotkey.borrow_mut() = disable_hotkey;
                 {
                     let prev_mouse_hides_on_focus = state.mouse_hides_on_focus;
+                    let prev_focus_follows_mouse_config_enabled =
+                        state.focus_follows_mouse_config_enabled;
+                    let prev_stack_line_enabled = state.stack_line_enabled;
+                    let prev_stack_line_hover_mode = state.stack_line_hover_mode;
                     state.mouse_hides_on_focus = mouse_hides_on_focus;
                     state.focus_follows_mouse_config_enabled = focus_follows_mouse_config_enabled;
                     state.stack_line_enabled = stack_line_enabled;
+                    state.stack_line_hover_mode = stack_line_hover_mode;
                     state.default_layout_mode = default_layout_mode;
                     let prev_active = state.disable_hotkey_active;
                     state.disable_hotkey_active = self
@@ -543,16 +446,26 @@ impl EventTap {
                         .unwrap_or(false);
                     if prev_active && !state.disable_hotkey_active {
                         state.reset(true);
+                        self.reset_mouse_move_sample_gate();
+                        self.reset_mouse_window();
                     }
-                    if prev_mouse_hides_on_focus && !state.mouse_hides_on_focus && state.hidden {
+                    if prev_focus_follows_mouse_config_enabled
+                        != state.focus_follows_mouse_config_enabled
+                        || prev_stack_line_enabled != state.stack_line_enabled
+                        || prev_stack_line_hover_mode != state.stack_line_hover_mode
+                    {
+                        state.reset_mouse_sampling();
+                        self.reset_mouse_move_sample_gate();
+                        self.reset_mouse_window();
+                    }
+                    if prev_mouse_hides_on_focus
+                        && !state.mouse_hides_on_focus
+                        && state.hide_count > 0
+                    {
                         debug!("Showing mouse after disabling mouse_hides_on_focus");
-                        if let Err(e) = event::show_mouse() {
-                            warn!("Failed to show mouse: {e:?}");
-                        }
-                        state.hidden = false;
+                        state.show_mouse();
                     }
                 }
-                should_update_gesture_handlers = true;
                 should_rebuild_mask = true;
             }
             Request::LayoutModesChanged(modes) => {
@@ -569,18 +482,16 @@ impl EventTap {
                 if state.low_power_mode != enabled {
                     debug!("low_power_mode changed in event tap: {}", enabled);
                     state.low_power_mode = enabled;
-                    state.last_mouse_move_loc = None;
-                    state.last_mouse_move_timestamp = 0;
+                    state.reset_mouse_sampling();
+                    self.mouse_move_min_interval_ns.set(mouse_move_sampling_profile(enabled));
+                    self.reset_mouse_move_sample_gate();
                 }
             }
         }
         drop(state);
 
-        if should_update_gesture_handlers {
-            self.update_gesture_handlers();
-        }
         if should_rebuild_mask {
-            self.rebuild_event_tap_mask_if_needed();
+            self.rebuild_event_tap_mask_if_needed(recovery_tx);
         }
     }
 
@@ -596,32 +507,30 @@ impl EventTap {
             } else {
                 debug!(?target, "focus_follows_mouse re-enabled after hotkey release");
                 state.reset(true);
+                self.reset_mouse_move_sample_gate();
+                self.reset_mouse_window();
             }
         }
     }
 
-    fn on_event(self: &Rc<Self>, event_type: CGEventType, event: &CGEvent) -> bool {
-        if event_type.0 == NSEventType::Gesture.0 as u32 {
-            let scroll_handler = self.scroll.borrow();
-            let swipe_handler = self.swipe.borrow();
-            if scroll_handler.is_none() && swipe_handler.is_none() {
-                return true;
-            }
+    #[inline]
+    fn reset_mouse_move_sample_gate(&self) { self.mouse_move_last_timestamp.set(None); }
 
-            let state = self.state.borrow_mut();
-            if let Some(nsevent) = NSEvent::eventWithCGEvent(event)
-                && nsevent.r#type() == NSEventType::Gesture
-            {
-                let cursor = CGEvent::location(Some(event));
-                let mode = state.layout_mode_at_point(cursor).unwrap_or(state.default_layout_mode);
-                let is_scrolling_mode = matches!(mode, LayoutMode::Scrolling);
-                if is_scrolling_mode && let Some(handler) = scroll_handler.as_ref() {
-                    self.handle_scroll_gesture_event(handler, &nsevent);
-                } else if let Some(handler) = swipe_handler.as_ref() {
-                    self.handle_gesture_event(handler, &nsevent);
-                }
-            }
-            return true;
+    #[inline]
+    fn reset_mouse_window(&self) { self.mouse_window.set(MouseWindow::default()); }
+
+    fn reconcile_after_tap_reenabled(&self) {
+        let mut state = self.state.borrow_mut();
+        let flags = CGEventSource::flags_state(CGEventSourceStateID::HIDSystemState);
+        debug!(?flags, "Event tap was re-enabled; reconciling pressed keys");
+        state.reconcile_after_event_tap_reenabled(flags);
+        drop(state);
+        self.refresh_disable_hotkey_state(&mut self.state.borrow_mut());
+    }
+
+    fn on_event(self: &Arc<Self>, event_type: CGEventType, event: &CGEvent) -> bool {
+        if event_type == CGEventType::MouseMoved {
+            return self.on_mouse_moved(event);
         }
 
         let mut state = self.state.borrow_mut();
@@ -635,6 +544,7 @@ impl EventTap {
             let flags = CGEvent::flags(Some(event));
             if flags != state.current_flags {
                 state.current_flags = flags;
+                state.reconcile_modifier_keys();
                 self.refresh_disable_hotkey_state(&mut state);
             }
         }
@@ -643,29 +553,21 @@ impl EventTap {
             CGEventType::LeftMouseDown | CGEventType::RightMouseDown => {
                 set_mouse_state(MouseState::Down);
 
-                if let Some(tx) = &self.stack_line_tx {
-                    let loc = CGEvent::location(Some(event));
+                let loc = CGEvent::location(Some(event));
 
-                    // The event tap is the single source of hit-testing for
-                    // stack-line indicators. Only forward the click and
-                    // suppress propagation when it lands on a visible,
-                    // non-occluded indicator.
-                    let hits_stack_line = self
-                        .stack_line_hit_rects
-                        .as_ref()
-                        .map(|hit_rects| {
-                            hit_rects
-                                .borrow()
-                                .iter()
-                                .copied()
-                                .any(|frame| point_hits_indicator_frame(loc, frame))
-                        })
-                        .unwrap_or(false);
-                    if hits_stack_line && !window_server::is_point_occluded_by_external_window(loc)
-                    {
-                        let _ = tx.try_send(stack_line::Event::MouseDown(loc));
-                        return false;
-                    }
+                // The event tap is the single source of hit-testing for
+                // stack-line indicators. Only forward the click and
+                // suppress propagation when it lands on a visible,
+                // non-occluded indicator.
+                let hits_stack_line = self
+                    .stack_line_hit_rects
+                    .load()
+                    .iter()
+                    .copied()
+                    .any(|frame| point_hits_indicator_frame(loc, frame));
+                if hits_stack_line && !window_server::is_point_occluded_by_external_window(loc) {
+                    let _ = self.stack_line_tx.try_send(stack_line::Event::MouseDown(loc));
+                    return false;
                 }
             }
             CGEventType::LeftMouseDragged | CGEventType::RightMouseDragged => {
@@ -679,6 +581,11 @@ impl EventTap {
             event_type,
             CGEventType::KeyDown | CGEventType::KeyUp | CGEventType::FlagsChanged
         ) {
+            // App-directed shortcuts generated by rift must reach the application instead of
+            // being interpreted as rift hotkeys again.
+            if event::is_rift_synthetic_event(event) {
+                return true;
+            }
             return self.handle_keyboard_event(event_type, event, &mut state);
         }
 
@@ -687,58 +594,13 @@ impl EventTap {
             return true;
         }
 
-        if state.hidden {
+        if state.hide_count > 0 {
             debug!("Showing mouse");
-            if let Err(e) = event::show_mouse() {
-                warn!("Failed to show mouse: {e:?}");
-            }
-            state.hidden = false;
+            state.show_mouse();
         }
         match event_type {
             CGEventType::RightMouseUp | CGEventType::LeftMouseUp => {
                 _ = self.events_tx.send(Event::MouseUp);
-            }
-            CGEventType::MouseMoved => {
-                let loc = CGEvent::location(Some(event));
-                let ts = CGEvent::timestamp(Some(event));
-                let sampling = mouse_move_sampling_profile(state.low_power_mode);
-                if !state.should_sample_mouse_move(loc, ts, sampling) {
-                    return true;
-                }
-
-                // stack line hover feedback
-                if state.stack_line_enabled
-                    && let Some(tx) = &self.stack_line_tx
-                {
-                    let hits = self
-                        .stack_line_hit_rects
-                        .as_ref()
-                        .map(|hit_rects| {
-                            hit_rects
-                                .borrow()
-                                .iter()
-                                .copied()
-                                .any(|frame| point_hits_indicator_frame(loc, frame))
-                        })
-                        .unwrap_or(false)
-                        && !window_server::is_point_occluded_by_external_window(loc);
-                    let _ = tx.try_send(stack_line::Event::MouseMoved {
-                        point: loc,
-                        hits_indicator: hits,
-                    });
-                }
-
-                // ffm
-                if state.focus_follows_mouse_config_enabled
-                    && state.focus_follows_mouse_enabled
-                    && !state.disable_hotkey_active
-                {
-                    if let Some(wsid) =
-                        state.track_mouse_move(loc, window_from_mouse_event(event), ts)
-                    {
-                        _ = self.events_tx.send(Event::MouseMovedOverWindow(wsid));
-                    }
-                }
             }
             _ => (),
         }
@@ -746,263 +608,124 @@ impl EventTap {
         true
     }
 
-    fn handle_gesture_event(&self, handler: &SwipeHandler, nsevent: &NSEvent) {
-        let cfg = &handler.cfg;
-        let state = &handler.state;
-        let Some(wm_sender) = self.wm_sender.as_ref() else {
-            state.borrow_mut().reset();
-            return;
-        };
-
-        let mut st = state.borrow_mut();
-
-        let phase = nsevent.phase();
-        if matches!(
-            phase,
-            NSEventPhase::Ended | NSEventPhase::Cancelled | NSEventPhase::Began
-        ) {
-            st.reset();
-            return;
+    /// Handle mouse moves without running the generic mouse/keyboard path.
+    ///
+    /// Mouse moves are usually the most frequent events delivered to this tap.
+    /// In particular, do not read CGEvent flags for every hardware event: the
+    /// keyboard and flags-changed events already maintain modifier state, and
+    /// the sampled move path below is sufficient as a recovery check.
+    fn on_mouse_moved(&self, event: &CGEvent) -> bool {
+        let mut state = self.state.borrow_mut();
+        if !state.event_processing_enabled {
+            return true;
         }
+        if state.hide_count > 0 {
+            debug!("Showing mouse");
+            state.show_mouse();
+        }
+        let loc = CGEvent::location(Some(event));
 
-        let touches = nsevent.allTouches();
-        let mut sum_x = 0.0f64;
-        let mut sum_y = 0.0f64;
-        let mut touch_count = 0usize;
-        let mut active_count = 0usize;
-        let mut too_many_touches = false;
-
-        for t in touches.iter() {
-            let phase = t.phase();
-            if phase.contains(NSTouchPhase::Stationary) {
-                continue;
-            }
-
-            let ended =
-                phase.contains(NSTouchPhase::Ended) || phase.contains(NSTouchPhase::Cancelled);
-
-            touch_count += 1;
-            if touch_count > cfg.fingers {
-                too_many_touches = true;
-                break;
-            }
-
-            if !ended && let Some((x, y)) = touch_normalized_position(&t) {
-                sum_x += x;
-                sum_y += y;
-                active_count += 1;
+        // Recover modifier state at the sampled rate instead of once per raw
+        // mouse event. Normal modifier transitions arrive through
+        // FlagsChanged; this is only the defensive reconciliation path for
+        // events lost while macOS UI interrupts the tap.
+        if self.disable_hotkey.borrow().is_some() {
+            let flags = CGEvent::flags(Some(event));
+            if flags != state.current_flags {
+                state.current_flags = flags;
+                state.reconcile_modifier_keys();
+                self.refresh_disable_hotkey_state(&mut state);
             }
         }
 
-        if too_many_touches || touch_count != cfg.fingers || active_count == 0 {
-            st.reset();
-            return;
-        }
-
-        let avg_x = sum_x / active_count as f64;
-        let avg_y = sum_y / active_count as f64;
-
-        match st.phase {
-            GesturePhase::Idle => {
-                st.start_x = avg_x;
-                st.start_y = avg_y;
-                st.phase = GesturePhase::Armed;
-                trace!(
-                    "swipe armed: start_x={:.3} start_y={:.3}",
-                    st.start_x, st.start_y
-                );
-            }
-            GesturePhase::Armed => {
-                let dx = avg_x - st.start_x;
-                let dy = avg_y - st.start_y;
-                let horizontal = dx.abs();
-                let vertical = dy.abs();
-
-                if horizontal >= cfg.distance_pct && vertical <= cfg.vertical_tolerance {
-                    let mut dir_left = dx < 0.0;
-                    if cfg.invert_horizontal {
-                        dir_left = !dir_left;
-                    }
-                    let cmd = if dir_left {
-                        LC::NextWorkspace(cfg.skip_empty_workspaces)
-                    } else {
-                        LC::PrevWorkspace(cfg.skip_empty_workspaces)
-                    };
-
-                    if cfg.haptics_enabled {
-                        let _ = haptics::perform_haptic(cfg.haptic_pattern);
-                    }
-                    wm_sender.send(WmEvent::Command(WmCommand::ReactorCommand(
-                        reactor::Command::Layout(cmd),
-                    )));
-                    st.phase = GesturePhase::Committed;
-                }
-            }
-            GesturePhase::Committed => {
-                if active_count == 0 {
-                    st.reset();
-                }
+        // Click mode only needs hit-test transitions for cursor feedback.
+        // Hover mode forwards samples so the actor can detect segment changes.
+        if state.stack_line_enabled {
+            let hits = self
+                .stack_line_hit_rects
+                .load()
+                .iter()
+                .copied()
+                .any(|frame| point_hits_indicator_frame(loc, frame))
+                && !window_server::is_point_occluded_by_external_window(loc);
+            if state.stack_line_hover_mode == StackLineHoverMode::Click
+                || state.last_stack_line_hit != Some(hits)
+            {
+                state.last_stack_line_hit = Some(hits);
+                let _ = self.stack_line_tx.try_send(stack_line::Event::MouseMoved {
+                    point: loc,
+                    hits_indicator: hits,
+                });
             }
         }
+
+        // Resolve and deduplicate the window on the input thread. The reactor
+        // only needs to see transitions; it must not receive a message for
+        // every sampled point while the cursor remains in one window.
+        if state.focus_follows_mouse_config_enabled
+            && state.focus_follows_mouse_enabled
+            && !state.disable_hotkey_active
+        {
+            let hint = mouse_window_hint(event);
+            let previous = self.mouse_window.get();
+            let window = Self::resolve_mouse_window(hint, loc, previous);
+            if previous.valid && previous.resolved == window {
+                // Keep the hint current even when WindowServer resolves both
+                // samples to the same window. This preserves the fast path
+                // after a transient overlay changes the CGEvent hint.
+                self.mouse_window.set(MouseWindow {
+                    hint,
+                    resolved: window,
+                    valid: true,
+                });
+                return true;
+            }
+            self.mouse_window.set(MouseWindow {
+                hint,
+                resolved: window,
+                valid: true,
+            });
+            if let Some(window) = window {
+                window_server::note_windowserver_activity(window.as_u32());
+                _ = self.events_tx.send(Event::MouseMoved(window));
+            }
+        }
+
+        true
     }
 
-    fn handle_scroll_gesture_event(&self, handler: &ScrollHandler, nsevent: &NSEvent) {
-        let cfg = &handler.cfg;
-        let state = &handler.state;
-        let Some(wm_sender) = self.wm_sender.as_ref() else {
-            state.borrow_mut().reset();
-            return;
-        };
-
-        let mut st = state.borrow_mut();
-
-        let phase = nsevent.phase();
-        if matches!(
-            phase,
-            NSEventPhase::Ended | NSEventPhase::Cancelled | NSEventPhase::Began
-        ) {
-            st.reset();
-            return;
+    #[inline]
+    fn resolve_mouse_window(
+        hint: Option<WindowServerId>,
+        point: CGPoint,
+        previous: MouseWindow,
+    ) -> Option<WindowServerId> {
+        // A non-empty CGEvent hint is stable while the pointer remains in the
+        // same window. Reuse the scalar result in that common case. When the
+        // hint is absent, the pointer can cross windows without changing it,
+        // so retain the fallback lookup for correctness.
+        if previous.valid && hint.is_some() && previous.hint == hint {
+            return previous.resolved;
         }
 
-        // let phase = nsevent.phase();
-        // if [NSEventPhase::Ended, NSEventPhase::Cancelled].contains(&phase) {
-        //     wm_sender.send(WmEvent::Command(WmCommand::ReactorCommand(
-        //         reactor::Command::Layout(LC::SnapStrip),
-        //     )));
-        //     st.reset();
-        //     return;
-        // }
-        // if phase == NSEventPhase::Began {
-        //     st.reset();
-        //     return;
-        // }
+        window_server::get_window_at_point(point)
+    }
 
-        let touches = nsevent.allTouches();
-        let mut sum_x = 0.0f64;
-        let mut sum_y = 0.0f64;
-        let mut touch_count = 0usize;
-        let mut active_count = 0usize;
-        let mut too_many_touches = false;
-        let mut all_moved = true;
-
-        for t in touches.iter() {
-            let phase = t.phase();
-            if phase.contains(NSTouchPhase::Stationary) {
-                all_moved = false;
-                continue;
-            }
-
-            if !phase.contains(NSTouchPhase::Moved) {
-                all_moved = false;
-            }
-
-            let ended =
-                phase.contains(NSTouchPhase::Ended) || phase.contains(NSTouchPhase::Cancelled);
-
-            touch_count += 1;
-            if touch_count > cfg.fingers {
-                too_many_touches = true;
-                break;
-            }
-
-            if !ended && let Some((x, y)) = touch_normalized_position(&t) {
-                sum_x += x;
-                sum_y += y;
-                active_count += 1;
-            }
+    /// Admit a mouse move for full processing. This deliberately contains
+    /// only scalar `Cell` operations so it can run before the callback's
+    /// panic boundary; rejected hardware events return directly to Core
+    /// Graphics without entering the expensive Rust callback path.
+    #[inline]
+    fn admit_mouse_move(&self, event: &CGEvent) -> bool {
+        let timestamp = CGEvent::timestamp(Some(event));
+        let last_timestamp = self.mouse_move_last_timestamp.get();
+        if last_timestamp.is_some_and(|last| {
+            timestamp.saturating_sub(last) < self.mouse_move_min_interval_ns.get()
+        }) {
+            return false;
         }
-
-        if too_many_touches || touch_count != cfg.fingers || active_count == 0 {
-            st.reset();
-            return;
-        }
-
-        let avg_x = sum_x / active_count as f64;
-        let avg_y = sum_y / active_count as f64;
-
-        match st.phase {
-            GesturePhase::Idle => {
-                st.start_x = avg_x;
-                st.start_y = avg_y;
-                st.last_x = avg_x;
-                st.last_y = avg_y;
-                st.accum_dx = 0.0;
-                st.phase = GesturePhase::Armed;
-                trace!(
-                    "scroll armed: start_x={:.3} start_y={:.3}",
-                    st.start_x, st.start_y
-                );
-            }
-            GesturePhase::Armed => {
-                if !all_moved {
-                    st.last_x = avg_x;
-                    st.last_y = avg_y;
-                    return;
-                }
-
-                let dx = avg_x - st.last_x;
-                let dy = avg_y - st.last_y;
-                let horizontal = dx.abs();
-                let vertical = dy.abs();
-
-                st.last_x = avg_x;
-                st.last_y = avg_y;
-
-                if vertical > cfg.vertical_tolerance || vertical >= horizontal {
-                    return;
-                }
-
-                st.accum_dx += dx;
-                let step = cfg.distance_pct;
-                if st.accum_dx.abs() >= step {
-                    let delta = if cfg.invert_horizontal {
-                        -st.accum_dx
-                    } else {
-                        st.accum_dx
-                    };
-                    let cmd = LC::ScrollStrip { delta };
-
-                    wm_sender.send(WmEvent::Command(WmCommand::ReactorCommand(
-                        reactor::Command::Layout(cmd),
-                    )));
-
-                    st.accum_dx = 0.0;
-                    st.phase = GesturePhase::Committed;
-                }
-            }
-            GesturePhase::Committed => {
-                if active_count == 0 {
-                    st.reset();
-                } else if all_moved {
-                    let dx = avg_x - st.last_x;
-                    let dy = avg_y - st.last_y;
-                    let horizontal = dx.abs();
-                    let vertical = dy.abs();
-                    st.last_x = avg_x;
-                    st.last_y = avg_y;
-                    if vertical > cfg.vertical_tolerance || vertical >= horizontal {
-                        return;
-                    }
-                    st.accum_dx += dx;
-                    let step = cfg.distance_pct;
-                    if st.accum_dx.abs() >= step {
-                        let delta = if cfg.invert_horizontal {
-                            -st.accum_dx
-                        } else {
-                            st.accum_dx
-                        };
-                        let cmd = LC::ScrollStrip { delta };
-
-                        wm_sender.send(WmEvent::Command(WmCommand::ReactorCommand(
-                            reactor::Command::Layout(cmd),
-                        )));
-
-                        st.accum_dx = 0.0;
-                    }
-                }
-            }
-        }
+        self.mouse_move_last_timestamp.set(Some(timestamp));
+        true
     }
 
     fn handle_keyboard_event(
@@ -1013,6 +736,11 @@ impl EventTap {
     ) -> bool {
         let key_code_opt = key_code_from_event(event);
 
+        // FlagsChanged must be interpreted using the flags from this event,
+        // rather than the previous event's modifier state.
+        let flags = CGEvent::flags(Some(event));
+        state.current_flags = flags;
+
         if let Some(key_code) = key_code_opt {
             match event_type {
                 CGEventType::KeyDown => state.note_key_down(key_code),
@@ -1021,9 +749,6 @@ impl EventTap {
                 _ => {}
             }
         }
-
-        let flags = CGEvent::flags(Some(event));
-        state.current_flags = flags;
         self.refresh_disable_hotkey_state(state);
 
         if event_type == CGEventType::KeyDown {
@@ -1032,14 +757,22 @@ impl EventTap {
                     modifiers_from_flags_with_keys(state.current_flags, &state.pressed_keys),
                     key_code,
                 );
-                let Some(wm_sender) = &self.wm_sender else {
-                    debug!(?hotkey, "Hotkey triggered but no WM sender available");
-                    return true;
-                };
-                let bindings = self.hotkeys.borrow();
+                let bindings = self.hotkeys.load();
                 if let Some(commands) = bindings.get(&hotkey) {
+                    // A held key generates repeated KeyDown events. Hotkeys
+                    // are press-triggered, so dispatching those repeats can
+                    // execute a command over and over. This is especially
+                    // surprising for workspace_auto_back_and_forth, where
+                    // each repeat toggles back to the other workspace.
+                    let is_repeat = CGEvent::integer_value_field(
+                        Some(event),
+                        CGEventField::KeyboardEventAutorepeat,
+                    ) != 0;
+                    if is_repeat {
+                        return false;
+                    }
                     for cmd in commands {
-                        wm_sender.send(WmEvent::Command(cmd.clone()));
+                        self.wm_sender.send(WmEvent::Command(cmd.clone()));
                     }
                     return false;
                 }
@@ -1051,8 +784,7 @@ impl EventTap {
 
     fn rebuild_hotkeys_for_current_layout(&self) {
         let specs = self.hotkey_specs.borrow();
-        let mut map = self.hotkeys.borrow_mut();
-        map.clear();
+        let mut map: HashMap<Hotkey, Vec<WmCommand>> = HashMap::default();
 
         for (spec, command) in specs.iter() {
             let Ok(hotkey) = Hotkey::from_str(spec) else {
@@ -1080,6 +812,7 @@ impl EventTap {
             "Updated hotkey bindings for current keyboard layout: {}",
             map.len()
         );
+        self.hotkeys.store(Arc::new(map));
     }
 }
 
@@ -1089,11 +822,21 @@ unsafe extern "C-unwind" fn mouse_callback(
     event_ref: core::ptr::NonNull<CGEvent>,
     user_info: *mut std::ffi::c_void,
 ) -> *mut CGEvent {
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let ctx = unsafe { &*(user_info as *const CallbackCtx) };
-        let event = unsafe { event_ref.as_ref() };
-        ctx.this.on_event(event_type, event)
-    }));
+    if user_info.is_null() {
+        return event_ref.as_ptr();
+    }
+    let ctx = unsafe { &*(user_info as *const CallbackCtx) };
+    let event = unsafe { event_ref.as_ref() };
+
+    // Keep rejected high-frequency mouse events out of catch_unwind and the
+    // actor/state path entirely. The admission check is scalar-only and has
+    // no fallible or panicking operations.
+    if event_type == CGEventType::MouseMoved && !ctx.this.admit_mouse_move(event) {
+        return event_ref.as_ptr();
+    }
+
+    let result =
+        std::panic::catch_unwind(AssertUnwindSafe(|| ctx.this.on_event(event_type, event)));
 
     match result {
         Ok(true) => event_ref.as_ptr(),
@@ -1102,35 +845,46 @@ unsafe extern "C-unwind" fn mouse_callback(
     }
 }
 
+unsafe extern "C-unwind" fn event_tap_reenabled(user_info: *mut std::ffi::c_void) {
+    if user_info.is_null() {
+        return;
+    }
+    let ctx = unsafe { &*(user_info as *const CallbackCtx) };
+    if std::panic::catch_unwind(AssertUnwindSafe(|| ctx.this.reconcile_after_tap_reenabled()))
+        .is_err()
+    {
+        error!("Panic while reconciling input state after event tap recovery");
+    }
+}
+
+unsafe extern "C-unwind" fn event_tap_invalidated(user_info: *mut std::ffi::c_void) {
+    if user_info.is_null() {
+        return;
+    }
+    let ctx = unsafe { &*(user_info as *const CallbackCtx) };
+    let _ = ctx.recovery_tx.send(Recovery::TapInvalidated(ctx.tap_generation));
+}
+
 impl State {
-    #[inline]
-    fn should_sample_mouse_move(
-        &mut self,
-        loc: CGPoint,
-        timestamp: u64,
-        sampling: (u64, f64),
-    ) -> bool {
-        let Some(last_loc) = self.last_mouse_move_loc else {
-            self.last_mouse_move_loc = Some(loc);
-            self.last_mouse_move_timestamp = timestamp;
-            return true;
-        };
-
-        let dx = loc.x - last_loc.x;
-        let dy = loc.y - last_loc.y;
-        let dist_sq = dx * dx + dy * dy;
-        let elapsed = timestamp.saturating_sub(self.last_mouse_move_timestamp);
-
-        if dist_sq < sampling.1 && elapsed < sampling.0 {
-            return false;
+    fn hide_mouse(&mut self) {
+        if let Err(e) = event::hide_mouse() {
+            warn!("Failed to hide mouse: {e:?}");
         }
-
-        self.last_mouse_move_loc = Some(loc);
-        self.last_mouse_move_timestamp = timestamp;
-        true
+        self.hide_count += 1;
     }
 
+    fn show_mouse(&mut self) {
+        while self.hide_count > 0 {
+            if let Err(e) = event::show_mouse() {
+                warn!("Failed to show mouse: {e:?}");
+            }
+            self.hide_count -= 1;
+        }
+    }
+
+    #[cfg(test)]
     fn layout_mode_at_point(&self, loc: CGPoint) -> Option<crate::common::config::LayoutMode> {
+        use crate::sys::geometry::CGRectExt;
         self.screen_spaces
             .iter()
             .find(|(frame, _)| frame.contains(loc))
@@ -1142,9 +896,33 @@ impl State {
     fn note_key_up(&mut self, key_code: KeyCode) { self.pressed_keys.remove(&key_code); }
 
     fn note_flags_changed(&mut self, key_code: KeyCode) {
-        if is_modifier_key(key_code) {
+        if !is_modifier_key(key_code) {
+            return;
+        }
+        // Use the device-dependent side bit; the family-wide mask cannot
+        // distinguish (for example) AltLeft from AltRight.
+        if modifier_key_is_active(self.current_flags, key_code) {
+            self.pressed_keys.insert(key_code);
+        } else {
             self.pressed_keys.remove(&key_code);
         }
+    }
+
+    fn reconcile_modifier_keys(&mut self) {
+        self.pressed_keys.retain(|key| {
+            if is_modifier_key(*key) {
+                modifier_key_is_active(self.current_flags, *key)
+            } else {
+                true // non-modifier keys are not reconciled here
+            }
+        });
+    }
+
+    fn reconcile_after_event_tap_reenabled(&mut self, flags: CGEventFlags) {
+        // Any key-up may have occurred while the tap was disabled. Discard the
+        // edge-triggered cache and use the authoritative live modifier state.
+        self.pressed_keys.clear();
+        self.current_flags = flags;
     }
 
     fn compute_disable_hotkey_active(&self, target: &Hotkey) -> bool {
@@ -1181,165 +959,39 @@ impl State {
 
     fn base_key_active(&self, key_code: KeyCode) -> bool {
         if is_modifier_key(key_code) {
-            modifier_flag_for_key(key_code)
-                .map(|flag| self.current_flags.contains(flag))
-                .unwrap_or(false)
+            modifier_key_is_active(self.current_flags, key_code)
         } else {
             self.pressed_keys.contains(&key_code)
         }
     }
 
-    fn track_mouse_move(
-        &mut self,
-        loc: CGPoint,
-        hinted_window: Option<WindowServerId>,
-        event_timestamp: u64,
-    ) -> Option<WindowServerId> {
-        let new_window = hinted_window.or_else(|| window_server::get_window_at_point(loc));
-        if self.above_window.0 == new_window {
-            return None;
-        }
-
-        let new_window_level = new_window
-            .map(|id| self.cached_window_level(id, event_timestamp))
-            .unwrap_or(NSWindowLevel::MIN);
-
-        debug!("Mouse is now above window {new_window:?} (level {new_window_level:?}) at {loc:?}");
-
-        // There is a gap between the menu bar and the actual menu pop-ups when
-        // a menu is opened. When the mouse goes over this gap, the system
-        // reports it to be over whatever window happens to be below the menu
-        // bar and behind the pop-up. Ignore anything in this gap so we don't
-        // dismiss the pop-up. Strangely, it only seems to happen when the mouse
-        // travels down from the menu bar and not when it travels back up.
-        // First observed on 13.5.2.
-        if self.above_window.1 == NSMainMenuWindowLevel {
-            const WITHIN: f64 = 1.0;
-            for screen in &self.screens {
-                if screen.contains(CGPoint::new(loc.x, loc.y + WITHIN))
-                    && loc.y < screen.min().y + WITHIN
-                {
-                    self.above_window = (new_window, new_window_level);
-                    return None;
-                }
-            }
-        }
-
-        let (old_window, old_window_level) =
-            replace(&mut self.above_window, (new_window, new_window_level));
-        debug!(?old_window, ?old_window_level, ?new_window, ?new_window_level);
-
-        if old_window_level >= NSPopUpMenuWindowLevel {
-            // Ignore one transition out of pop-up/menu-like windows to avoid
-            // stealing focus while transient UI is closing, but clear the
-            // latch so the next move over the same window can recover.
-            self.above_window = (None, NSWindowLevel::MIN);
-            return None;
-        }
-
-        if !(0..NSPopUpMenuWindowLevel).contains(&new_window_level)
-            && new_window_level != NSWindowLevel::MIN
-        {
-            return None;
-        }
-
-        new_window
-    }
-
     fn reset(&mut self, enabled: bool) {
         if enabled {
-            self.above_window = (None, NSWindowLevel::MIN);
-            self.last_mouse_move_loc = None;
-            self.last_mouse_move_timestamp = 0;
-            self.window_level_cache.clear();
-            self.window_level_cache_last_prune_at = 0;
+            self.reset_mouse_sampling();
         }
     }
 
     #[inline]
-    fn cached_window_level(&mut self, id: WindowServerId, event_timestamp: u64) -> NSWindowLevel {
-        if event_timestamp.saturating_sub(self.window_level_cache_last_prune_at)
-            >= WINDOW_LEVEL_CACHE_PRUNE_INTERVAL_NS
-        {
-            let cutoff = event_timestamp.saturating_sub(WINDOW_LEVEL_CACHE_TTL_NS);
-            self.window_level_cache.retain(|_, cached| cached.observed_at >= cutoff);
-            self.window_level_cache_last_prune_at = event_timestamp;
+    fn reset_mouse_sampling(&mut self) { self.last_stack_line_hit = None; }
+}
 
-            // Defensive bound for long sessions with heavy transient-window churn.
-            if self.window_level_cache.len() > WINDOW_LEVEL_CACHE_MAX_ENTRIES {
-                let mut items: Vec<(WindowServerId, u64)> = self
-                    .window_level_cache
-                    .iter()
-                    .map(|(wid, cached)| (*wid, cached.observed_at))
-                    .collect();
-                items.sort_unstable_by_key(|(_, observed_at)| *observed_at);
-                let drop_count = items.len() - WINDOW_LEVEL_CACHE_MAX_ENTRIES;
-                for (wid, _) in items.into_iter().take(drop_count) {
-                    self.window_level_cache.remove(&wid);
-                }
-            }
-        }
-
-        if let Some(cached) = self.window_level_cache.get(&id) {
-            if event_timestamp.saturating_sub(cached.observed_at) <= WINDOW_LEVEL_CACHE_TTL_NS {
-                return cached.level;
-            }
-        }
-
-        let level =
-            trace_misc("window_level", || window_level(id.into())).unwrap_or(NSWindowLevel::MIN);
-        self.window_level_cache.insert(id, CachedWindowLevel {
-            level,
-            observed_at: event_timestamp,
-        });
-        level
+#[inline]
+fn mouse_move_sampling_profile(low_power_mode: bool) -> u64 {
+    if low_power_mode {
+        MOUSE_MOVE_MIN_INTERVAL_NS_LOW_POWER
+    } else {
+        MOUSE_MOVE_MIN_INTERVAL_NS_NORMAL
     }
 }
 
 #[inline]
-fn window_from_mouse_event(event: &CGEvent) -> Option<WindowServerId> {
+fn mouse_window_hint(event: &CGEvent) -> Option<WindowServerId> {
     let field_value =
         CGEvent::integer_value_field(Some(event), CGEventField::MouseEventWindowUnderMousePointer);
-    let id = u32::try_from(field_value).ok()?;
-    (id != 0).then(|| WindowServerId::new(id))
+    u32::try_from(field_value).ok().filter(|id| *id != 0).map(WindowServerId::new)
 }
 
-#[inline]
-fn mouse_move_sampling_profile(low_power_mode: bool) -> (u64, f64) {
-    if low_power_mode {
-        (
-            MOUSE_MOVE_MIN_INTERVAL_NS_LOW_POWER,
-            MOUSE_MOVE_MIN_DISTANCE_PX_SQ_LOW_POWER,
-        )
-    } else {
-        (
-            MOUSE_MOVE_MIN_INTERVAL_NS_NORMAL,
-            MOUSE_MOVE_MIN_DISTANCE_PX_SQ_NORMAL,
-        )
-    }
-}
-
-#[inline]
-fn touch_normalized_position(touch: &objc2_app_kit::NSTouch) -> Option<(f64, f64)> {
-    if touch.r#type() != NSTouchType::Indirect || touch.isResting() {
-        return None;
-    }
-
-    let position = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        exception::catch(AssertUnwindSafe(|| touch.normalizedPosition())).ok()
-    }))
-    .ok()
-    .flatten()?;
-    let x = position.x.clamp(0.0, 1.0) as f64;
-    let y = position.y.clamp(0.0, 1.0) as f64;
-    Some((x, y))
-}
-
-fn build_event_mask(
-    gestures_enabled: bool,
-    keyboard_enabled: bool,
-    mouse_move_enabled: bool,
-) -> CGEventMask {
+fn build_event_mask(keyboard_enabled: bool, mouse_move_enabled: bool) -> CGEventMask {
     let mut m: u64 = 0;
     let add = |m: &mut u64, ty: CGEventType| *m |= 1u64 << (ty.0 as u64);
 
@@ -1364,10 +1016,6 @@ fn build_event_mask(
         ] {
             add(&mut m, ty);
         }
-    }
-    if gestures_enabled {
-        // NSEventType::Gesture is an NSEventType — it maps via .0
-        *&mut m |= 1u64 << (NSEventType::Gesture.0 as u64);
     }
     m
 }
@@ -1406,5 +1054,18 @@ mod tests {
             state.layout_mode_at_point(CGPoint::new(150.0, 50.0)),
             Some(crate::common::config::LayoutMode::Scrolling)
         );
+    }
+
+    #[test]
+    fn tap_recovery_discards_cached_keys_and_uses_live_flags() {
+        let mut state = State::default();
+        state.pressed_keys.insert(KeyCode::ShiftLeft);
+        state.pressed_keys.insert(KeyCode::KeyA);
+
+        let live_flags = CGEventFlags::MaskShift | CGEventFlags::MaskCommand;
+        state.reconcile_after_event_tap_reenabled(live_flags);
+
+        assert!(state.pressed_keys.is_empty());
+        assert_eq!(state.current_flags, live_flags);
     }
 }

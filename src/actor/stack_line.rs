@@ -1,7 +1,8 @@
-use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::rc::Rc;
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use objc2::MainThreadMarker;
 use objc2_app_kit::NSCursor;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -9,9 +10,10 @@ use tracing::instrument;
 
 use crate::actor::app::WindowId;
 use crate::actor::reactor::{Command, ReactorCommand};
+use crate::actor::spaces::ForwardedSpaceState;
 use crate::actor::{self, reactor};
 use crate::common::collections::HashMap;
-use crate::common::config::{Config, HorizontalPlacement, VerticalPlacement};
+use crate::common::config::{Config, HorizontalPlacement, StackLineHoverMode, VerticalPlacement};
 use crate::layout_engine::LayoutKind;
 use crate::model::tree::NodeId;
 use crate::sys::screen::{CoordinateConverter, SpaceId};
@@ -20,9 +22,10 @@ use crate::ui::stack_line::{
 };
 
 /// Shared indicator hit-rect state readable from the event tap callback.
-pub type SharedHitRects = Rc<RefCell<Vec<CGRect>>>;
+/// Uses Arc<ArcSwap<...>> for lock-free reads from the input thread.
+pub type SharedHitRects = Arc<ArcSwap<Vec<CGRect>>>;
 
-pub fn new_shared_hit_rects() -> SharedHitRects { Rc::new(RefCell::new(Vec::new())) }
+pub fn new_shared_hit_rects() -> SharedHitRects { Arc::new(ArcSwap::from_pointee(Vec::new())) }
 
 #[derive(Debug, Clone)]
 pub struct GroupInfo {
@@ -43,7 +46,7 @@ pub enum Event {
         groups: Vec<GroupInfo>,
         active_workspace_for_space_has_fullscreen: bool,
     },
-    ScreenParametersChanged(CoordinateConverter),
+    SpaceStateUpdated(CoordinateConverter, ForwardedSpaceState),
     ConfigUpdated(Config),
     /// A click that the event tap already confirmed lands on a visible,
     /// non-occluded stack-line indicator.
@@ -68,6 +71,7 @@ pub struct StackLine {
     coordinate_converter: CoordinateConverter,
     group_sigs_by_space: HashMap<SpaceId, Vec<GroupSig>>,
     cursor_over_indicator: bool,
+    hovered_segment: Option<(NodeId, usize)>,
     shared_hit_rects: SharedHitRects,
 }
 
@@ -92,6 +96,7 @@ impl StackLine {
             coordinate_converter,
             group_sigs_by_space: HashMap::default(),
             cursor_over_indicator: false,
+            hovered_segment: None,
             shared_hit_rects,
         }
     }
@@ -112,14 +117,13 @@ impl StackLine {
     /// Publish the current indicator frames so the event tap can suppress
     /// clicks that land on a visible, non-occluded indicator.
     fn sync_shared_hit_rects(&self) {
-        let mut rects = self.shared_hit_rects.borrow_mut();
-        rects.clear();
-        if !self.is_enabled() {
-            return;
+        let mut rects = Vec::new();
+        if self.is_enabled() {
+            for indicator in self.indicators.values().filter(|i| i.is_visible()) {
+                rects.push(indicator.frame());
+            }
         }
-        for indicator in self.indicators.values().filter(|indicator| indicator.is_visible()) {
-            rects.push(indicator.frame());
-        }
+        self.shared_hit_rects.store(Arc::new(rects));
     }
 
     #[instrument(name = "stack_line::handle_event", skip(self))]
@@ -128,7 +132,7 @@ impl StackLine {
             && !matches!(
                 event,
                 Event::ConfigUpdated(_)
-                    | Event::ScreenParametersChanged(_)
+                    | Event::SpaceStateUpdated(..)
                     | Event::MouseDown(_)
                     | Event::MouseMoved { .. }
             )
@@ -150,8 +154,8 @@ impl StackLine {
                 );
                 self.sync_shared_hit_rects();
             }
-            Event::ScreenParametersChanged(converter) => {
-                self.handle_screen_parameters_changed(converter);
+            Event::SpaceStateUpdated(converter, _space_state) => {
+                self.handle_space_state_updated(converter);
             }
             Event::ConfigUpdated(config) => {
                 self.handle_config_updated(config);
@@ -229,7 +233,7 @@ impl StackLine {
         }
     }
 
-    fn handle_screen_parameters_changed(&mut self, converter: CoordinateConverter) {
+    fn handle_space_state_updated(&mut self, converter: CoordinateConverter) {
         self.coordinate_converter = converter;
         tracing::debug!("Updated coordinate converter for group indicators");
     }
@@ -237,6 +241,7 @@ impl StackLine {
     fn handle_config_updated(&mut self, config: Config) {
         let old_enabled = self.is_enabled();
         self.config = config;
+        self.hovered_segment = None;
         let new_enabled = self.is_enabled();
 
         if old_enabled && !new_enabled {
@@ -293,14 +298,14 @@ impl StackLine {
                     segment_index,
                     "Detected click on stack line indicator segment"
                 );
-                self.handle_indicator_clicked(node_id, segment_index);
+                self.handle_indicator_activated(node_id, segment_index);
                 return;
             }
         }
     }
 
     // this is very hacky but we don't use nswindow so we have to roll this ourselves
-    fn handle_mouse_moved(&mut self, _screen_point: CGPoint, hits_indicator: bool) {
+    fn handle_mouse_moved(&mut self, screen_point: CGPoint, hits_indicator: bool) {
         let over_indicator = self.is_enabled() && hits_indicator;
 
         if over_indicator != self.cursor_over_indicator {
@@ -313,9 +318,45 @@ impl StackLine {
                 tracing::trace!("Reset to arrow cursor");
             }
         }
+
+        if self.config.settings.ui.stack_line.hover != StackLineHoverMode::Click {
+            self.hovered_segment = None;
+            return;
+        }
+
+        let hovered_segment = if over_indicator {
+            self.indicators.iter().find_map(|(&node_id, indicator)| {
+                if !indicator.is_visible() {
+                    return None;
+                }
+                let frame = indicator.frame();
+                if !point_hits_indicator_frame(screen_point, frame) {
+                    return None;
+                }
+                let local_point =
+                    CGPoint::new(screen_point.x - frame.origin.x, screen_point.y - frame.origin.y);
+                indicator.check_click(local_point).map(|segment_index| (node_id, segment_index))
+            })
+        } else {
+            None
+        };
+
+        if hovered_segment == self.hovered_segment {
+            return;
+        }
+        self.hovered_segment = hovered_segment;
+
+        if let Some((node_id, segment_index)) = hovered_segment {
+            tracing::debug!(
+                ?node_id,
+                segment_index,
+                "Hovered over stack line indicator segment"
+            );
+            self.handle_indicator_activated(node_id, segment_index);
+        }
     }
 
-    fn handle_indicator_clicked(&mut self, node_id: NodeId, segment_index: usize) {
+    fn handle_indicator_activated(&mut self, node_id: NodeId, segment_index: usize) {
         if let Some(indicator) = self.indicators.get(&node_id) {
             let window_ids = indicator.window_ids();
             if let Some(window_id) = window_ids.get(segment_index) {
@@ -323,7 +364,7 @@ impl StackLine {
                     ?node_id,
                     segment_index,
                     ?window_id,
-                    "Group indicator clicked - focusing window"
+                    "Group indicator activated - focusing window"
                 );
                 let _ = self.reactor_tx.send(reactor::Event::Command(Command::Reactor(
                     ReactorCommand::FocusWindow {
@@ -335,14 +376,14 @@ impl StackLine {
                 tracing::debug!(
                     ?node_id,
                     segment_index,
-                    "Group indicator clicked with invalid segment index"
+                    "Group indicator activated with invalid segment index"
                 );
             }
         } else {
             tracing::debug!(
                 ?node_id,
                 segment_index,
-                "Group indicator clicked but not found in map"
+                "Group indicator activated but not found in map"
             );
         }
     }
@@ -418,7 +459,7 @@ impl StackLine {
             unsafe {
                 // safety: `self_ptr` remains valid while the actor lives.
                 let this: &mut StackLine = &mut *self_ptr;
-                this.handle_indicator_clicked(node_id, segment_index);
+                this.handle_indicator_activated(node_id, segment_index);
             }
         }));
 

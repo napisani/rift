@@ -8,12 +8,14 @@ use objc2_application_services::AXUIElement;
 use rift_wm::actor::config::ConfigActor;
 use rift_wm::actor::config_watcher::ConfigWatcher;
 use rift_wm::actor::event_tap::EventTap;
+use rift_wm::actor::gesture_tap::GestureTap;
 use rift_wm::actor::menu_bar::Menu;
 use rift_wm::actor::mission_control::MissionControlActor;
 use rift_wm::actor::mission_control_observer::NativeMissionControl;
 use rift_wm::actor::notification_center::NotificationCenter;
 use rift_wm::actor::process::ProcessActor;
 use rift_wm::actor::reactor::{self, Reactor};
+use rift_wm::actor::spaces::SpacesActor;
 use rift_wm::actor::stack_line::StackLine;
 use rift_wm::actor::window_notify as window_notify_actor;
 use rift_wm::actor::wm_controller::{self, WmController};
@@ -30,6 +32,7 @@ use rift_wm::sys::screen::{CoordinateConverter, displays_have_separate_spaces};
 use rift_wm::sys::service::{ServiceCommands, handle_service_command};
 use rift_wm::sys::skylight::{
     CGEnableEventStateCombining, CGSEventType, CGSetLocalEventsSuppressionInterval, KnownCGSEvent,
+    SLSWindowManagementBridgeSetDelegate,
 };
 use tokio::join;
 
@@ -51,11 +54,11 @@ struct Cli {
     #[arg(long)]
     no_animate: bool,
 
-    /// No-op compatibility check for the deprecated restore file path.
+    /// Check whether the saved layout snapshot can be loaded.
     #[arg(long)]
     validate: bool,
 
-    /// Deprecated no-op flag retained for CLI compatibility.
+    /// Restore the master layout file saved at shutdown.
     #[arg(long)]
     restore: bool,
 
@@ -122,6 +125,8 @@ fn main() {
         NSApplication::load();
     }
 
+    unsafe { SLSWindowManagementBridgeSetDelegate(std::ptr::null_mut()) };
+
     ensure_accessibility_permission();
     init_window_sub_level_server_port();
 
@@ -144,14 +149,45 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
     config.settings.default_disable |= opt.default_disable;
 
     if opt.validate {
-        return;
+        let path = restore_file();
+        match LayoutEngine::load(path.clone()) {
+            Ok(_) => println!("Master file is valid: {}", path.display()),
+            Err(error) => {
+                eprintln!("Could not load master file at {}: {error}", path.display());
+                process::exit(1);
+            }
+        }
+        process::exit(0);
     }
 
     execute_startup_commands(&config.settings.run_on_start);
 
     let (broadcast_tx, broadcast_rx) = rift_wm::actor::channel();
 
-    let layout = LayoutEngine::new(
+    let mut layout = if opt.restore {
+        let path = restore_file();
+        match LayoutEngine::load_for_startup_restore(path.clone()) {
+            Ok(layout) => layout,
+            Err(error) => {
+                eprintln!(
+                    "Could not restore master file at {}; starting with a fresh layout: {error}",
+                    path.display()
+                );
+                LayoutEngine::new(
+                    &config.virtual_workspaces,
+                    &config.settings.layout,
+                    Some(broadcast_tx.clone()),
+                )
+            }
+        }
+    } else {
+        LayoutEngine::new(
+            &config.virtual_workspaces,
+            &config.settings.layout,
+            Some(broadcast_tx.clone()),
+        )
+    };
+    layout.finish_loading(
         &config.virtual_workspaces,
         &config.settings.layout,
         Some(broadcast_tx.clone()),
@@ -161,6 +197,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
     let (stack_line_tx, stack_line_rx) = rift_wm::actor::channel();
     let (wnd_tx, wnd_rx) = rift_wm::actor::channel();
     let window_tx_store = WindowTxStore::new();
+    let (gesture_tap_tx, gesture_tap_rx) = rift_wm::actor::channel();
     let reactor = Reactor::spawn(
         config.clone(),
         layout,
@@ -170,6 +207,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         menu_tx.clone(),
         stack_line_tx.clone(),
         Some((wnd_tx.clone(), window_tx_store.clone())),
+        Some(gesture_tap_tx.clone()),
         opt.one,
     );
     let events_tx = reactor.sender();
@@ -178,20 +216,6 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         ConfigActor::spawn_with_path(config.clone(), events_tx.clone(), config_path.clone());
 
     ConfigWatcher::spawn(config_tx.clone(), config.clone(), config_path.clone());
-
-    let wn_actor = window_notify_actor::WindowNotify::new(
-        events_tx.clone(),
-        wnd_rx,
-        &[
-            CGSEventType::Known(KnownCGSEvent::SpaceWindowDestroyed),
-            CGSEventType::Known(KnownCGSEvent::SpaceWindowCreated),
-            CGSEventType::Known(KnownCGSEvent::SpaceCreated),
-            CGSEventType::Known(KnownCGSEvent::SpaceDestroyed),
-            //CGSEventType::Known(KnownCGSEvent::WindowMoved),
-            //CGSEventType::Known(KnownCGSEvent::WindowResized),
-        ],
-        Some(window_tx_store.clone()),
-    );
 
     let server_state = match ipc::run_mach_server(reactor.clone(), config_tx.clone()) {
         Ok(state) => state,
@@ -228,16 +252,48 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
     let (_mc_native_tx, mc_native_rx) = rift_wm::actor::channel();
     let (wm_controller, wm_controller_sender) = WmController::new(
         wm_config,
+        config_tx.clone(),
         events_tx.clone(),
         event_tap_tx.clone(),
         stack_line_tx.clone(),
         mc_tx.clone(),
+        Some(gesture_tap_tx.clone()),
         Some(window_tx_store.clone()),
     );
 
     let _ = events_tx.send(reactor::Event::RegisterWmSender(wm_controller_sender.clone()));
 
-    let notification_center = NotificationCenter::new(wm_controller_sender.clone());
+    let (spaces_actor, spaces_tx) =
+        SpacesActor::new(events_tx.clone(), wm_controller_sender.clone());
+    let wn_actor = window_notify_actor::WindowNotify::new(
+        events_tx.clone(),
+        spaces_tx.clone(),
+        wnd_rx,
+        &[
+            // this event seems bugged
+            //CGSEventType::Known(KnownCGSEvent::SpaceCurrentChanged),
+            // repl for aboce
+            CGSEventType::Known(KnownCGSEvent::WorkspaceDidChange),
+            CGSEventType::Known(KnownCGSEvent::ManagedSpaceMembershipUpdated),
+            CGSEventType::Known(KnownCGSEvent::SpaceWindowManagementCapabilitiesChanged),
+            CGSEventType::Known(KnownCGSEvent::SpaceWindowDestroyed),
+            CGSEventType::Known(KnownCGSEvent::SpaceWindowCreated),
+            // Native focus wakeups. Payload identities are racy, so adjacent
+            // events are coalesced before re-querying WindowServer key focus.
+            CGSEventType::Known(KnownCGSEvent::WindowReordered),
+            CGSEventType::Known(KnownCGSEvent::WindowUnhidden),
+            CGSEventType::Known(KnownCGSEvent::WindowHidden),
+            CGSEventType::Known(KnownCGSEvent::WindowManagerSpaceFrontConnectionChanged),
+            CGSEventType::Known(KnownCGSEvent::WindowManagerGlobalFrontConnectionChanged),
+            CGSEventType::Known(KnownCGSEvent::SpaceCreated),
+            CGSEventType::Known(KnownCGSEvent::SpaceDestroyed),
+            //CGSEventType::Known(KnownCGSEvent::WindowMoved),
+            //CGSEventType::Known(KnownCGSEvent::WindowResized),
+        ],
+        Some(window_tx_store.clone()),
+    );
+
+    let notification_center = NotificationCenter::new(wm_controller_sender.clone(), spaces_tx);
 
     let process_actor = ProcessActor::new(wm_controller_sender.clone());
 
@@ -246,10 +302,11 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         config.clone(),
         events_tx.clone(),
         event_tap_rx,
-        Some(wm_controller_sender.clone()),
-        Some(stack_line_tx.clone()),
-        Some(stack_line_hit_rects.clone()),
+        wm_controller_sender.clone(),
+        stack_line_tx.clone(),
+        stack_line_hit_rects.clone(),
     );
+    let gesture_tap = GestureTap::new(config.clone(), wm_controller_sender.clone(), gesture_tap_rx);
     let menu = Menu::new(
         config.clone(),
         menu_rx,
@@ -282,6 +339,16 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
     CGSetLocalEventsSuppressionInterval(0.0);
     CGEnableEventStateCombining(false);
 
+    // The event tap runs on a dedicated thread with its own CFRunLoop,
+    // isolated from main-thread stalls (layout, animation, SLS IPC).
+    std::thread::Builder::new()
+        .name("input".into())
+        .spawn(move || {
+            rift_wm::sys::executor::Executor::run(event_tap.run());
+            panic!("input thread exited");
+        })
+        .expect("failed to spawn input thread");
+
     Executor::run_main(mtm, async move {
         join!(
             supervise("wm_controller", wm_controller.run()),
@@ -289,7 +356,8 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
                 "notification_center",
                 notification_center.watch_for_notifications()
             ),
-            supervise("event_tap", event_tap.run()),
+            supervise("spaces", spaces_actor.run()),
+            supervise("gesture_tap", gesture_tap.run()),
             supervise("menu", menu.run()),
             supervise("stack_line", stack_line.run()),
             supervise("window_notify", wn_actor.run()),

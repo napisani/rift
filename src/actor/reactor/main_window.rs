@@ -6,6 +6,8 @@ use crate::common::collections::HashMap;
 pub(crate) struct MainWindowTracker {
     apps: HashMap<pid_t, AppState>,
     global_frontmost: Option<pid_t>,
+    window_server_focus: Option<WindowId>,
+    window_server_focus_authoritative: bool,
 }
 
 struct AppState {
@@ -30,6 +32,15 @@ impl MainWindowTracker {
             }
             &Event::ApplicationThreadTerminated(pid) => {
                 self.apps.remove(&pid);
+                if self.window_server_focus.is_some_and(|wid| wid.pid == pid) {
+                    self.window_server_focus = None;
+                }
+                return None;
+            }
+            &Event::WindowDestroyed(wid) => {
+                if self.window_server_focus == Some(wid) {
+                    self.window_server_focus = None;
+                }
                 return None;
             }
             &Event::ApplicationActivated(pid, quiet) => {
@@ -45,12 +56,18 @@ impl MainWindowTracker {
             }
             &Event::ApplicationGloballyActivated(pid) => {
                 self.global_frontmost = Some(pid);
-                let Some(app) = self.apps.get(&pid) else { return None };
+                let Some(app) = self.apps.get_mut(&pid) else {
+                    return None;
+                };
+                app.is_frontmost = true;
                 (pid, app.frontmost_is_quiet)
             }
             &Event::ApplicationGloballyDeactivated(pid) => {
                 if self.global_frontmost == Some(pid) {
                     self.global_frontmost = None;
+                }
+                if let Some(app) = self.apps.get_mut(&pid) {
+                    app.is_frontmost = false;
                 }
                 return None;
             }
@@ -59,8 +76,20 @@ impl MainWindowTracker {
                 app.main_window = wid;
                 (pid, quiet)
             }
+            &Event::WindowServerFocusChanged(wid, _) => {
+                self.window_server_focus_authoritative = true;
+                self.window_server_focus = Some(wid);
+                return None;
+            }
             _ => return None,
         };
+        // Once WindowServer focus has produced a result, AX activation/main-window
+        // events remain useful as metadata and cold-start fallback only. Letting
+        // them emit focus here can replay the previous native focus while the new
+        // 808/815 resolution is still in flight.
+        if self.window_server_focus_authoritative {
+            return None;
+        }
         if Some(event_pid) == self.global_frontmost && quiet_edge == Quiet::No {
             if let Some(wid) = self.main_window() {
                 return Some(wid);
@@ -73,6 +102,9 @@ impl MainWindowTracker {
         let Some(pid) = self.global_frontmost else {
             return None;
         };
+        if let Some(window) = self.window_server_focus.filter(|window| window.pid == pid) {
+            return Some(window);
+        }
         match self.apps.get(&pid) {
             Some(&AppState {
                 is_frontmost: true,
@@ -82,6 +114,22 @@ impl MainWindowTracker {
             _ => None,
         }
     }
+
+    /// Consume the quiet marker associated with the current global activation.
+    ///
+    /// A workspace switch can raise an app and cause both the app-local
+    /// activation event and the separate global activation notification to be
+    /// delivered. The latter does not carry `Quiet`, so retain the marker from
+    /// the former until the global notification is handled.
+    pub fn take_global_activation_quiet(&mut self, pid: pid_t) -> Quiet {
+        if self.global_frontmost != Some(pid) {
+            return Quiet::No;
+        }
+        self.apps
+            .get_mut(&pid)
+            .map(|app| std::mem::replace(&mut app.frontmost_is_quiet, Quiet::No))
+            .unwrap_or(Quiet::No)
+    }
 }
 
 #[cfg(test)]
@@ -89,9 +137,51 @@ mod tests {
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     use test_log::test;
 
-    use super::super::testing::{Apps, make_windows, screen_params_event};
+    use super::super::testing::{Apps, make_windows, space_state_event};
     use super::super::{Event, Quiet, Reactor, SpaceId, WindowId};
+    use super::{AppState, MainWindowTracker};
     use crate::layout_engine::LayoutEngine;
+
+    #[test]
+    fn window_server_focus_supersedes_ax_focus_events() {
+        let ax_window = WindowId::new(7, 1);
+        let server_window = WindowId::new(7, 2);
+        let stale_window = WindowId::new(7, 3);
+        let mut tracker = MainWindowTracker::default();
+        tracker.global_frontmost = Some(7);
+        tracker.apps.insert(7, AppState {
+            is_frontmost: true,
+            frontmost_is_quiet: Quiet::No,
+            main_window: Some(ax_window),
+        });
+
+        assert_eq!(tracker.main_window(), Some(ax_window));
+        assert_eq!(
+            tracker.handle_event(&Event::WindowServerFocusChanged(server_window, SpaceId::new(1),)),
+            None
+        );
+        assert_eq!(tracker.main_window(), Some(server_window));
+
+        assert_eq!(
+            tracker.handle_event(&Event::ApplicationMainWindowChanged(
+                7,
+                Some(stale_window),
+                Quiet::No,
+            )),
+            None,
+            "AX must not drive focus after native authority is initialized"
+        );
+        assert_eq!(tracker.main_window(), Some(server_window));
+
+        let _ = tracker.handle_event(&Event::ApplicationMainWindowChanged(
+            7,
+            Some(ax_window),
+            Quiet::No,
+        ));
+
+        let _ = tracker.handle_event(&Event::WindowDestroyed(server_window));
+        assert_eq!(tracker.main_window(), Some(ax_window));
+    }
 
     #[test]
     fn it_tracks_frontmost_app_and_main_window_correctly() {
@@ -104,11 +194,7 @@ mod tests {
         ));
         let space = SpaceId::new(1);
         let screen_frame = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1920., 1080.));
-        reactor.handle_event(screen_params_event(
-            vec![screen_frame],
-            vec![Some(space)],
-            vec![],
-        ));
+        reactor.handle_event(space_state_event(vec![screen_frame], vec![Some(space)]));
         assert_eq!(None, reactor.main_window());
 
         reactor.handle_event(ApplicationGloballyActivated(1));
@@ -180,11 +266,7 @@ mod tests {
         ));
         let space = SpaceId::new(1);
         let screen_frame = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1920., 1080.));
-        reactor.handle_event(screen_params_event(
-            vec![screen_frame],
-            vec![Some(space)],
-            vec![],
-        ));
+        reactor.handle_event(space_state_event(vec![screen_frame], vec![Some(space)]));
 
         reactor.handle_event(ApplicationGloballyActivated(1));
         reactor.handle_events(apps.make_app_with_opts(
@@ -267,11 +349,7 @@ mod tests {
         let windows = make_windows(2);
         let space = SpaceId::new(1);
         let screen_frame = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1920., 1080.));
-        reactor.handle_event(screen_params_event(
-            vec![screen_frame],
-            vec![Some(space)],
-            vec![],
-        ));
+        reactor.handle_event(space_state_event(vec![screen_frame], vec![Some(space)]));
 
         reactor.handle_events(apps.make_app_with_opts(
             pid,
@@ -281,7 +359,7 @@ mod tests {
             true,
         ));
 
-        reactor.handle_event(SpaceChanged(vec![None]));
+        reactor.handle_event(space_state_event(vec![screen_frame], vec![None]));
         reactor.handle_event(ApplicationActivated(3, Quiet::No));
         reactor.handle_event(ApplicationGloballyActivated(3));
         reactor.handle_event(WindowsDiscovered {
@@ -291,7 +369,7 @@ mod tests {
         });
         assert_eq!(Some(WindowId::new(3, 1)), reactor.main_window());
 
-        reactor.handle_event(SpaceChanged(vec![Some(space)]));
+        reactor.handle_event(space_state_event(vec![screen_frame], vec![Some(space)]));
         assert_eq!(
             reactor.layout_manager.layout_engine.selected_window(space),
             Some(WindowId::new(3, 1))

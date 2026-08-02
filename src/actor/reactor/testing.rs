@@ -4,6 +4,7 @@ use tracing::debug;
 use super::{Event, Reactor, Record, Requested, ScreenInfo, TransactionId};
 use crate::actor;
 use crate::actor::app::{AppThreadHandle, Request, WindowId};
+use crate::actor::spaces::ForwardedSpaceState;
 use crate::common::collections::BTreeMap;
 use crate::common::config::Config;
 use crate::layout_engine::LayoutEngine;
@@ -45,12 +46,33 @@ pub fn make_screen_snapshots(frames: Vec<CGRect>, spaces: Vec<Option<SpaceId>>) 
         .collect()
 }
 
-pub fn screen_params_event(
-    frames: Vec<CGRect>,
-    spaces: Vec<Option<SpaceId>>,
-    _ws_info: Vec<WindowServerInfo>,
-) -> Event {
-    Event::ScreenParametersChanged(make_screen_snapshots(frames, spaces))
+pub fn space_state_event(frames: Vec<CGRect>, spaces: Vec<Option<SpaceId>>) -> Event {
+    space_state_event_from_screens(make_screen_snapshots(frames, spaces))
+}
+
+pub fn space_state_event_from_screens(screens: Vec<ScreenInfo>) -> Event {
+    let command_space = screens.iter().find_map(|screen| screen.space);
+    let active_spaces = screens.iter().filter_map(|screen| screen.space).collect();
+    Event::SpaceStateChanged(ForwardedSpaceState {
+        screens,
+        fullscreen_spaces: Default::default(),
+        has_seen_display_set: false,
+        active_spaces,
+        menu_bar_space: command_space,
+        command_space,
+        display_space_ids: Default::default(),
+        last_user_space_by_display: Default::default(),
+        space_remaps: Vec::new(),
+        display_set_changed: false,
+        topology_changed: false,
+        allow_space_remap: false,
+        should_force_refresh_layout: false,
+        releases_lifecycle_refresh_quarantine: false,
+        releases_display_churn_refresh_quarantine: false,
+        resized_spaces: Vec::new(),
+        topology_window_delta: None,
+        active_window_spaces: Default::default(),
+    })
 }
 
 /*impl Drop for Reactor {
@@ -136,6 +158,19 @@ impl Apps {
         is_frontmost: bool,
         with_ws_info: bool,
     ) -> Vec<Event> {
+        let windows: Vec<WindowInfo> = windows
+            .into_iter()
+            .enumerate()
+            .map(|(idx, mut info)| {
+                // Keep synthetic window-server ids unique across apps so tests
+                // exercise the same invariants as production.
+                info.sys_id = Some(WindowServerId::new(
+                    (pid as u32).saturating_mul(10_000) + idx as u32 + 1,
+                ));
+                info
+            })
+            .collect();
+
         for (id, info) in (1..).map(|idx| WindowId::new(pid, idx)).zip(&windows) {
             self.windows.insert(id, TestWindowState {
                 frame: info.frame,
@@ -256,6 +291,25 @@ impl Apps {
                     window.last_seen_txid = txid;
                     let old_frame = window.frame;
                     window.frame.origin = pos;
+                    if !window.animating && !old_frame.same_as(window.frame) {
+                        events.push(Event::WindowFrameChanged(
+                            wid,
+                            window.frame,
+                            Some(txid),
+                            Requested(true),
+                            None,
+                        ));
+                    }
+                }
+                Request::AnimationFrame { wid, frame, set_size, txid } => {
+                    let window = self.windows.entry(wid).or_default();
+                    window.last_seen_txid = txid;
+                    let old_frame = window.frame;
+                    if set_size {
+                        window.frame = frame;
+                    } else {
+                        window.frame.origin = frame.origin;
+                    }
                     if !window.animating && !old_frame.same_as(window.frame) {
                         events.push(Event::WindowFrameChanged(
                             wid,
