@@ -6,7 +6,7 @@ use crate::common::collections::{HashMap, HashSet};
 use crate::layout_engine::systems::constraints::{AxisConstraints, solve_axis_lengths};
 use crate::layout_engine::systems::{LayoutSystem, WindowLayoutConstraints};
 use crate::layout_engine::utils::compute_tiling_area;
-use crate::layout_engine::{Direction, LayoutId, LayoutKind, Orientation};
+use crate::layout_engine::{Direction, LayoutId, LayoutKind, Orientation, ResizeOrientation};
 use crate::model::selection::*;
 use crate::model::tree::{NodeId, NodeMap, Tree};
 
@@ -857,6 +857,49 @@ mod tests {
     }
 
     #[test]
+    fn non_binding_window_minimum_keeps_half_split_centered() {
+        let mut system = BspLayoutSystem::default();
+        let layout = system.create_layout();
+
+        let browser = w(106);
+        let finder = w(107);
+        system.add_window_after_selection(layout, browser);
+        system.add_window_after_selection(layout, finder);
+
+        let mut constraints = HashMap::default();
+        constraints.insert(
+            finder,
+            WindowLayoutConstraints {
+                is_resizable: true,
+                min_width: 400.0,
+                ..Default::default()
+            }
+            .normalized(),
+        );
+
+        let screen = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1200.0, 900.0));
+        let frames: HashMap<WindowId, CGRect> = system
+            .calculate_layout(
+                layout,
+                screen,
+                0.0,
+                &constraints,
+                &Default::default(),
+                0.0,
+                Default::default(),
+                Default::default(),
+            )
+            .into_iter()
+            .collect();
+
+        let browser_frame = frames.get(&browser).copied().expect("browser frame missing");
+        let finder_frame = frames.get(&finder).copied().expect("Finder frame missing");
+        assert!((browser_frame.size.width - 600.0).abs() < 1.0);
+        assert!((finder_frame.size.width - 600.0).abs() < 1.0);
+        assert!((finder_frame.origin.x - 600.0).abs() < 1.0);
+    }
+
+    #[test]
     fn max_only_height_does_not_cap_cross_axis_subtree() {
         let mut system = BspLayoutSystem::default();
         let layout = system.create_layout();
@@ -926,6 +969,8 @@ impl LayoutSystem for BspLayoutSystem {
         let state = LayoutState { root: leaf };
         self.layouts.insert(state)
     }
+
+    fn contains_layout(&self, layout: LayoutId) -> bool { self.layouts.contains_key(layout) }
 
     /// shallow
     fn clone_layout(&mut self, layout: LayoutId) -> LayoutId {
@@ -1007,6 +1052,14 @@ impl LayoutSystem for BspLayoutSystem {
 
     fn selected_window(&self, layout: LayoutId) -> Option<WindowId> {
         self.layouts.get(layout).and_then(|s| self.selection_window(s))
+    }
+
+    fn all_windows_in_layout(&self, layout: LayoutId) -> Vec<WindowId> {
+        let mut out = Vec::new();
+        if let Some(state) = self.layouts.get(layout).copied() {
+            self.collect_windows_under(state.root, &mut out);
+        }
+        out
     }
 
     fn visible_windows_in_layout(&self, layout: LayoutId) -> Vec<WindowId> {
@@ -1093,6 +1146,21 @@ impl LayoutSystem for BspLayoutSystem {
                 // Fall back to default insertion
                 self.insert_window_at_selection(layout, wid);
             }
+        }
+    }
+
+    fn replace_window(&mut self, from: WindowId, to: WindowId) {
+        if from == to {
+            return;
+        }
+        let Some(node) = self.window_to_node.remove(&from) else {
+            return;
+        };
+        if let Some(NodeKind::Leaf { window, .. }) = self.kind.get_mut(node)
+            && *window == Some(from)
+        {
+            *window = Some(to);
+            self.window_to_node.insert(to, node);
         }
     }
 
@@ -1504,6 +1572,21 @@ impl LayoutSystem for BspLayoutSystem {
         }
     }
 
+    fn consume_or_expel_selection(&mut self, layout: LayoutId, direction: Direction) {
+        let is_joined = self
+            .selection_of_layout(layout)
+            .map(|selection| self.descend_to_leaf(selection))
+            .and_then(|leaf| leaf.parent(&self.tree.map))
+            .and_then(|parent| parent.parent(&self.tree.map))
+            .is_some();
+
+        if is_joined {
+            self.unjoin_selection(layout);
+        } else {
+            self.join_selection_with_direction(layout, direction);
+        }
+    }
+
     fn apply_stacking_to_parent_of_selection(
         &mut self,
         _: LayoutId,
@@ -1565,14 +1648,28 @@ impl LayoutSystem for BspLayoutSystem {
         }
     }
 
-    fn resize_selection_by(&mut self, layout: LayoutId, amount: f64) {
+    fn resize_selection_by(
+        &mut self,
+        layout: LayoutId,
+        amount: f64,
+        orientation: ResizeOrientation,
+    ) {
         let sel_snapshot = self.selection_of_layout(layout);
         let Some(mut node) = sel_snapshot else {
             return;
         };
 
         while let Some(parent) = node.parent(&self.tree.map) {
-            if let Some(NodeKind::Split { ratio, .. }) = self.kind.get_mut(parent) {
+            if let Some(NodeKind::Split {
+                orientation: split_orientation,
+                ratio,
+            }) = self.kind.get_mut(parent)
+                && match orientation {
+                    ResizeOrientation::Horizontal => *split_orientation == Orientation::Horizontal,
+                    ResizeOrientation::Vertical => *split_orientation == Orientation::Vertical,
+                    ResizeOrientation::Smart => true,
+                }
+            {
                 let is_first = Some(node) == parent.first_child(&self.tree.map);
                 let delta = (amount as f32) * 0.5;
                 if is_first {

@@ -9,12 +9,22 @@ use crate::common::config::{ScrollingFocusNavigationStyle, ScrollingLayoutSettin
 use crate::layout_engine::systems::constraints::{AxisConstraints, solve_axis_lengths};
 use crate::layout_engine::systems::{LayoutSystem, WindowLayoutConstraints};
 use crate::layout_engine::utils::compute_tiling_area;
-use crate::layout_engine::{Direction, LayoutId, LayoutKind};
+use crate::layout_engine::{Direction, LayoutId, LayoutKind, ResizeOrientation};
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct Column {
     windows: Vec<WindowId>,
     width_offset: f64,
+    #[serde(default)]
+    height_weights: Vec<f64>,
+}
+
+impl Column {
+    fn ensure_height_weights(&mut self) {
+        if self.height_weights.len() != self.windows.len() {
+            self.height_weights.resize(self.windows.len(), 1.0);
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -158,7 +168,9 @@ impl LayoutState {
     fn remove_window(&mut self, wid: WindowId) -> Option<WindowId> {
         let (col_idx, row_idx) = self.locate(wid)?;
         let col = &mut self.columns[col_idx];
+        col.ensure_height_weights();
         col.windows.remove(row_idx);
+        col.height_weights.remove(row_idx);
         if col.windows.is_empty() {
             self.columns.remove(col_idx);
         }
@@ -196,6 +208,7 @@ impl LayoutState {
         let column = Column {
             windows: vec![wid],
             width_offset: 0.0,
+            height_weights: vec![1.0],
         };
         let insert_at = (index + 1).min(self.columns.len());
         self.columns.insert(insert_at, column);
@@ -207,6 +220,7 @@ impl LayoutState {
         self.columns.push(Column {
             windows: vec![wid],
             width_offset: 0.0,
+            height_weights: vec![1.0],
         });
         self.selected = Some(wid);
         self.align_scroll_to_selected();
@@ -217,7 +231,9 @@ impl LayoutState {
             if col_idx == target_col {
                 return;
             }
+            self.columns[col_idx].ensure_height_weights();
             let window = self.columns[col_idx].windows.remove(row_idx);
+            let weight = self.columns[col_idx].height_weights.remove(row_idx);
             let removed_column = self.columns[col_idx].windows.is_empty();
             if removed_column {
                 self.columns.remove(col_idx);
@@ -231,9 +247,12 @@ impl LayoutState {
                 self.columns.push(Column {
                     windows: vec![window],
                     width_offset: 0.0,
+                    height_weights: vec![1.0],
                 });
             } else {
+                self.columns[target].ensure_height_weights();
                 self.columns[target].windows.push(window);
+                self.columns[target].height_weights.push(weight);
             }
             self.selected = Some(window);
             self.align_scroll_to_selected();
@@ -505,7 +524,9 @@ impl ScrollingLayoutSystem {
             _ => None,
         };
         let Some(target_idx) = target_idx else { return false };
+        column.ensure_height_weights();
         column.windows.swap(row_idx, target_idx);
+        column.height_weights.swap(row_idx, target_idx);
         state.selected = Some(column.windows[target_idx]);
         true
     }
@@ -518,7 +539,9 @@ impl ScrollingLayoutSystem {
         // If the current column is stacked, horizontal move should extract the selected
         // window into its own neighbor column. This is a faster way to undo accidental stacks.
         if state.columns[col_idx].windows.len() > 1 {
+            state.columns[col_idx].ensure_height_weights();
             let wid = state.columns[col_idx].windows.remove(row_idx);
+            let weight = state.columns[col_idx].height_weights.remove(row_idx);
             let insert_at = match dir {
                 Direction::Left => col_idx,
                 Direction::Right => (col_idx + 1).min(state.columns.len()),
@@ -527,6 +550,7 @@ impl ScrollingLayoutSystem {
             state.columns.insert(insert_at, Column {
                 windows: vec![wid],
                 width_offset: 0.0,
+                height_weights: vec![weight],
             });
             state.selected = Some(wid);
             return true;
@@ -553,6 +577,8 @@ impl LayoutSystem for ScrollingLayoutSystem {
     fn create_layout(&mut self) -> LayoutId {
         self.layouts.insert(LayoutState::new(self.settings.column_width_ratio))
     }
+
+    fn contains_layout(&self, layout: LayoutId) -> bool { self.layouts.contains_key(layout) }
 
     fn clone_layout(&mut self, layout: LayoutId) -> LayoutId {
         let cloned = self
@@ -606,7 +632,11 @@ impl LayoutSystem for ScrollingLayoutSystem {
         let mut column_widths = Vec::with_capacity(state.columns.len());
         let mut column_ratios = Vec::with_capacity(state.columns.len());
         for col in state.columns.iter() {
-            let ratio = self.clamp_ratio(base_ratio + col.width_offset);
+            let ratio = if state.columns.len() == 1 {
+                1.0
+            } else {
+                self.clamp_ratio(base_ratio + col.width_offset)
+            };
             let base_width = (tiling.size.width * ratio).max(1.0);
             let mut min_w: f64 = 1.0;
             let mut fixed_w: Option<f64> = None;
@@ -673,12 +703,43 @@ impl LayoutSystem for ScrollingLayoutSystem {
             tiling.origin.x
         } else {
             match self.settings.alignment {
-                crate::common::config::ScrollingAlignment::Left => tiling.origin.x,
+                crate::common::config::ScrollingAlignment::Left => {
+                    if !niri_navigation
+                        && state.center_override_window.is_none()
+                        && state.columns.len() > 1
+                        && selected_col_idx == state.columns.len() - 1
+                    {
+                        tiling.origin.x + tiling.size.width - selected_width
+                    } else {
+                        tiling.origin.x
+                    }
+                }
                 crate::common::config::ScrollingAlignment::Center => {
-                    tiling.origin.x + (tiling.size.width - selected_width) / 2.0
+                    if !niri_navigation
+                        && state.center_override_window.is_none()
+                        && state.columns.len() > 1
+                    {
+                        if selected_col_idx == 0 {
+                            tiling.origin.x
+                        } else if selected_col_idx == state.columns.len() - 1 {
+                            tiling.origin.x + tiling.size.width - selected_width
+                        } else {
+                            tiling.origin.x + (tiling.size.width - selected_width) / 2.0
+                        }
+                    } else {
+                        tiling.origin.x + (tiling.size.width - selected_width) / 2.0
+                    }
                 }
                 crate::common::config::ScrollingAlignment::Right => {
-                    tiling.origin.x + tiling.size.width - selected_width
+                    if !niri_navigation
+                        && state.center_override_window.is_none()
+                        && state.columns.len() > 1
+                        && selected_col_idx == 0
+                    {
+                        tiling.origin.x
+                    } else {
+                        tiling.origin.x + tiling.size.width - selected_width
+                    }
                 }
             }
         };
@@ -774,7 +835,8 @@ impl LayoutSystem for ScrollingLayoutSystem {
             let row_constraints: Vec<AxisConstraints> = col
                 .windows
                 .iter()
-                .map(|wid| {
+                .enumerate()
+                .map(|(row_idx, wid)| {
                     let (min, fixed, max, can_grow) = constraints
                         .get(wid)
                         .copied()
@@ -788,11 +850,22 @@ impl LayoutSystem for ScrollingLayoutSystem {
                             )
                         })
                         .unwrap_or((0.0, None, None, true));
+                    let raw_weight = col.height_weights.get(row_idx).copied().unwrap_or(1.0);
+                    // The constraint solver first assigns `min` to every item,
+                    // then distributes the *remainder* proportionally by weight.
+                    // Our height_weights store desired pixel heights, so we must
+                    // subtract `min` to turn them into "growth above min" weights.
+                    // Without this adjustment, weights like [900, 100] with
+                    // min=[100,100] would produce [820, 180] instead of [900, 100].
+                    //
+                    // For default weights (all 1.0), the subtraction would make
+                    // them near-zero but still equal, preserving equal distribution.
+                    let weight = (raw_weight - min).max(0.001);
                     AxisConstraints {
                         min,
                         fixed,
                         max,
-                        weight: 1.0,
+                        weight,
                         can_grow,
                     }
                 })
@@ -851,6 +924,10 @@ impl LayoutSystem for ScrollingLayoutSystem {
 
     fn selected_window(&self, layout: LayoutId) -> Option<WindowId> {
         self.layout_state(layout).and_then(|state| state.selected_or_first())
+    }
+
+    fn all_windows_in_layout(&self, layout: LayoutId) -> Vec<WindowId> {
+        self.layout_state(layout).map(Self::all_windows).unwrap_or_default()
     }
 
     fn visible_windows_in_layout(&self, layout: LayoutId) -> Vec<WindowId> {
@@ -937,6 +1014,10 @@ impl LayoutSystem for ScrollingLayoutSystem {
     }
 
     fn add_window_after_selection(&mut self, layout: LayoutId, wid: WindowId) {
+        let niri_navigation = matches!(
+            self.settings.focus_navigation_style,
+            ScrollingFocusNavigationStyle::Niri
+        );
         let Some(state) = self.layout_state_mut(layout) else {
             return;
         };
@@ -946,6 +1027,36 @@ impl LayoutSystem for ScrollingLayoutSystem {
             state.insert_column_after(0, wid);
         } else {
             state.insert_column_at_end(wid);
+        }
+        if niri_navigation {
+            state.reveal_selected_without_direction();
+        }
+    }
+
+    fn replace_window(&mut self, from: WindowId, to: WindowId) {
+        if from == to {
+            return;
+        }
+        for state in self.layouts.values_mut() {
+            for column in &mut state.columns {
+                for window in &mut column.windows {
+                    if *window == from {
+                        *window = to;
+                    }
+                }
+            }
+            if state.selected == Some(from) {
+                state.selected = Some(to);
+            }
+            if state.center_override_window == Some(from) {
+                state.center_override_window = Some(to);
+            }
+            if state.fullscreen.remove(&from) {
+                state.fullscreen.insert(to);
+            }
+            if state.fullscreen_within_gaps.remove(&from) {
+                state.fullscreen_within_gaps.insert(to);
+            }
         }
     }
 
@@ -983,6 +1094,10 @@ impl LayoutSystem for ScrollingLayoutSystem {
     }
 
     fn set_windows_for_app(&mut self, layout: LayoutId, pid: pid_t, desired: Vec<WindowId>) {
+        let niri_navigation = matches!(
+            self.settings.focus_navigation_style,
+            ScrollingFocusNavigationStyle::Niri
+        );
         let Some(state) = self.layout_state_mut(layout) else {
             return;
         };
@@ -1018,6 +1133,9 @@ impl LayoutSystem for ScrollingLayoutSystem {
                 }
                 (None, None) => break,
             }
+        }
+        if niri_navigation {
+            state.reveal_selected_without_direction();
         }
     }
 
@@ -1088,10 +1206,63 @@ impl LayoutSystem for ScrollingLayoutSystem {
         let clamped = ratio.clamp(min_ratio, max_ratio).max(0.05);
 
         let base_ratio = state.column_width_ratio;
-        let Some((col_idx, _)) = state.locate(wid) else {
+        let Some((col_idx, row_idx)) = state.locate(wid) else {
             return;
         };
         state.columns[col_idx].width_offset = clamped - base_ratio;
+
+        // Handle vertical resizing within columns
+        let col = &mut state.columns[col_idx];
+        if col.windows.len() > 1 && tiling.size.height > 0.0 {
+            col.ensure_height_weights();
+            let total_gap = gaps.inner.vertical * (col.windows.len().saturating_sub(1) as f64);
+            let available_height = (tiling.size.height - total_gap).max(0.0);
+
+            if available_height > 0.0 {
+                // Set weights directly to desired pixel heights. The constraint
+                // solver (`solve_axis_lengths`) first reserves each window's
+                // minimum height, then distributes the remainder proportionally
+                // by weight.  Using actual pixel heights as weights means the
+                // solver will naturally produce the user's intended split,
+                // subject only to the macOS-reported min/max constraints.
+                let new_resized_height = new_frame.size.height.max(1.0);
+                let new_other_total = (available_height - new_resized_height).max(1.0);
+
+                // Distribute the "other" portion among non-resized windows,
+                // preserving their relative proportions.
+                let other_weight_sum: f64 = col
+                    .height_weights
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, _)| i != row_idx)
+                    .map(|(_, &w)| w)
+                    .sum();
+
+                if other_weight_sum > 0.0 {
+                    for i in 0..col.windows.len() {
+                        if i == row_idx {
+                            col.height_weights[i] = new_resized_height;
+                        } else {
+                            // Scale each other window's weight so their sum equals new_other_total.
+                            col.height_weights[i] =
+                                new_other_total * (col.height_weights[i] / other_weight_sum);
+                        }
+                    }
+                } else {
+                    // Fallback: no prior weights for other windows.
+                    let other_count = (col.windows.len() - 1).max(1) as f64;
+                    let share = new_other_total / other_count;
+                    for i in 0..col.windows.len() {
+                        if i == row_idx {
+                            col.height_weights[i] = new_resized_height;
+                        } else {
+                            col.height_weights[i] = share;
+                        }
+                    }
+                }
+            }
+        }
+
         if niri_navigation && state.selected == Some(wid) {
             state.reveal_selected_without_direction();
         } else if state.selected == Some(wid) {
@@ -1112,12 +1283,21 @@ impl LayoutSystem for ScrollingLayoutSystem {
             None => return false,
         };
         if a_col == b_col {
+            state.columns[a_col].ensure_height_weights();
             state.columns[a_col].windows.swap(a_row, b_row);
+            state.columns[a_col].height_weights.swap(a_row, b_row);
         } else {
+            state.columns[a_col].ensure_height_weights();
+            state.columns[b_col].ensure_height_weights();
             let a_window = state.columns[a_col].windows[a_row];
             let b_window = state.columns[b_col].windows[b_row];
             state.columns[a_col].windows[a_row] = b_window;
             state.columns[b_col].windows[b_row] = a_window;
+
+            let a_weight = state.columns[a_col].height_weights[a_row];
+            let b_weight = state.columns[b_col].height_weights[b_row];
+            state.columns[a_col].height_weights[a_row] = b_weight;
+            state.columns[b_col].height_weights[b_row] = a_weight;
         }
         true
     }
@@ -1145,12 +1325,20 @@ impl LayoutSystem for ScrollingLayoutSystem {
         from_layout: LayoutId,
         to_layout: LayoutId,
     ) {
+        let niri_navigation = matches!(
+            self.settings.focus_navigation_style,
+            ScrollingFocusNavigationStyle::Niri
+        );
         let Some(selected) = self.selected_window(from_layout) else {
             return;
         };
         if let Some(state) = self.layout_state_mut(from_layout) {
             state.remove_window(selected);
-            state.align_scroll_to_selected();
+            if niri_navigation {
+                state.reveal_selected_without_direction();
+            } else {
+                state.align_scroll_to_selected();
+            }
         }
         if let Some(state) = self.layout_state_mut(to_layout) {
             if let Some((col_idx, _)) = state.selected_location() {
@@ -1158,7 +1346,11 @@ impl LayoutSystem for ScrollingLayoutSystem {
             } else {
                 state.insert_column_at_end(selected);
             }
-            state.align_scroll_to_selected();
+            if niri_navigation {
+                state.reveal_selected_without_direction();
+            } else {
+                state.align_scroll_to_selected();
+            }
         }
     }
 
@@ -1221,6 +1413,56 @@ impl LayoutSystem for ScrollingLayoutSystem {
         state.move_window_to_column_end(selected, target_col);
     }
 
+    fn consume_or_expel_selection(&mut self, layout: LayoutId, direction: Direction) {
+        if !matches!(direction, Direction::Left | Direction::Right) {
+            return;
+        }
+
+        let is_joined = self
+            .layout_state(layout)
+            .and_then(|state| {
+                let (col_idx, _) = state.selected_location()?;
+                Some(state.columns[col_idx].windows.len() > 1)
+            })
+            .unwrap_or(false);
+
+        if !is_joined {
+            self.join_selection_with_direction(layout, direction);
+            return;
+        }
+
+        let niri_navigation = matches!(
+            self.settings.focus_navigation_style,
+            ScrollingFocusNavigationStyle::Niri
+        );
+        let Some(state) = self.layout_state_mut(layout) else {
+            return;
+        };
+        let Some((col_idx, row_idx)) = state.selected_location() else {
+            return;
+        };
+        state.columns[col_idx].ensure_height_weights();
+        let wid = state.columns[col_idx].windows.remove(row_idx);
+        let weight = state.columns[col_idx].height_weights.remove(row_idx);
+        let insert_at = match direction {
+            Direction::Left => col_idx,
+            Direction::Right => col_idx + 1,
+            Direction::Up | Direction::Down => unreachable!(),
+        };
+        state.columns.insert(insert_at, Column {
+            windows: vec![wid],
+            width_offset: 0.0,
+            height_weights: vec![weight],
+        });
+        state.selected = Some(wid);
+        if niri_navigation {
+            state.reveal_selected_without_direction();
+        } else {
+            state.align_scroll_to_selected();
+        }
+        state.clamp_scroll_offset();
+    }
+
     fn apply_stacking_to_parent_of_selection(
         &mut self,
         layout: LayoutId,
@@ -1265,22 +1507,31 @@ impl LayoutSystem for ScrollingLayoutSystem {
         if state.columns[col_idx].windows.len() <= 1 {
             return Vec::new();
         }
+        state.columns[col_idx].ensure_height_weights();
         let selected = state.columns[col_idx].windows[row_idx];
+        let windows = std::mem::take(&mut state.columns[col_idx].windows);
+        let weights = std::mem::take(&mut state.columns[col_idx].height_weights);
         let mut moved = Vec::new();
         let mut remaining = Vec::new();
-        for wid in state.columns[col_idx].windows.drain(..) {
+        let mut remaining_weights = Vec::new();
+        let mut moved_weights = Vec::new();
+        for (wid, w) in windows.into_iter().zip(weights.into_iter()) {
             if wid == selected {
                 remaining.push(wid);
+                remaining_weights.push(w);
             } else {
                 moved.push(wid);
+                moved_weights.push(w);
             }
         }
         state.columns[col_idx].windows = remaining;
+        state.columns[col_idx].height_weights = remaining_weights;
         let mut insert_at = col_idx + 1;
-        for wid in moved.iter().copied() {
+        for (idx, wid) in moved.iter().copied().enumerate() {
             state.columns.insert(insert_at, Column {
                 windows: vec![wid],
                 width_offset: 0.0,
+                height_weights: vec![moved_weights[idx]],
             });
             insert_at += 1;
         }
@@ -1298,6 +1549,10 @@ impl LayoutSystem for ScrollingLayoutSystem {
     }
 
     fn unjoin_selection(&mut self, layout: LayoutId) {
+        let niri_navigation = matches!(
+            self.settings.focus_navigation_style,
+            ScrollingFocusNavigationStyle::Niri
+        );
         let Some(state) = self.layout_state_mut(layout) else {
             return;
         };
@@ -1308,18 +1563,30 @@ impl LayoutSystem for ScrollingLayoutSystem {
         if state.columns[col_idx].windows.len() <= 1 {
             return;
         }
+        state.columns[col_idx].ensure_height_weights();
         let wid = state.columns[col_idx].windows.remove(row_idx);
+        let weight = state.columns[col_idx].height_weights.remove(row_idx);
         let insert_at = (col_idx + 1).min(state.columns.len());
         state.columns.insert(insert_at, Column {
             windows: vec![wid],
             width_offset: 0.0,
+            height_weights: vec![weight],
         });
         state.selected = Some(wid);
-        state.align_scroll_to_selected();
+        if niri_navigation {
+            state.reveal_selected_without_direction();
+        } else {
+            state.align_scroll_to_selected();
+        }
         state.clamp_scroll_offset();
     }
 
-    fn resize_selection_by(&mut self, layout: LayoutId, amount: f64) {
+    fn resize_selection_by(
+        &mut self,
+        layout: LayoutId,
+        amount: f64,
+        orientation: ResizeOrientation,
+    ) {
         let min_ratio = self.settings.min_column_width_ratio;
         let max_ratio = self.settings.max_column_width_ratio;
         let niri_navigation = matches!(
@@ -1331,11 +1598,41 @@ impl LayoutSystem for ScrollingLayoutSystem {
         };
         let base_ratio = state.column_width_ratio;
 
-        let Some((col_idx, _)) = state.selected_location() else {
+        let Some((col_idx, row_idx)) = state.selected_location() else {
+            if orientation == ResizeOrientation::Vertical {
+                return;
+            }
             let ratio = base_ratio + amount;
             state.column_width_ratio = ratio.clamp(min_ratio, max_ratio).max(0.05);
             return;
         };
+
+        let resize_vertically = orientation == ResizeOrientation::Vertical
+            || (orientation == ResizeOrientation::Smart
+                && state.columns[col_idx].windows.len() > 1);
+        if resize_vertically {
+            let column = &mut state.columns[col_idx];
+            if column.windows.len() < 2 {
+                return;
+            }
+            column.ensure_height_weights();
+            let total: f64 = column.height_weights.iter().sum();
+            if total <= f64::EPSILON {
+                return;
+            }
+            let current_share = column.height_weights[row_idx] / total;
+            let next_share = (current_share + amount).clamp(0.05, 0.95);
+            let other_total = (total - column.height_weights[row_idx]).max(f64::EPSILON);
+            let scale = total.max(10_000.0);
+            for (idx, weight) in column.height_weights.iter_mut().enumerate() {
+                if idx == row_idx {
+                    *weight = next_share * scale;
+                } else {
+                    *weight = (1.0 - next_share) * scale * (*weight / other_total);
+                }
+            }
+            return;
+        }
 
         let current = base_ratio + state.columns[col_idx].width_offset;
         let next = current + amount;
@@ -1365,7 +1662,7 @@ mod tests {
     use crate::common::config::{GapSettings, ScrollingLayoutSettings};
     use crate::layout_engine::systems::{LayoutSystem, WindowLayoutConstraints};
     use crate::layout_engine::utils::compute_tiling_area;
-    use crate::layout_engine::{Direction, LayoutId};
+    use crate::layout_engine::{Direction, LayoutId, ResizeOrientation};
 
     fn wid(pid: pid_t, idx: u32) -> WindowId {
         WindowId {
@@ -1478,6 +1775,7 @@ mod tests {
         state.columns = vec![Column {
             windows: vec![w1, w2],
             width_offset: 0.0,
+            height_weights: vec![1.0, 1.0],
         }];
         state.selected = Some(w1);
 
@@ -1560,6 +1858,7 @@ mod tests {
         state.columns = vec![Column {
             windows: vec![locked, capped],
             width_offset: 0.0,
+            height_weights: vec![1.0, 1.0],
         }];
         state.selected = Some(locked);
 
@@ -1846,7 +2145,7 @@ mod tests {
             crate::common::config::ScrollingFocusNavigationStyle::Anchored;
         let (mut system, layout, w1, w2) = setup_two_windows(settings);
         let _ = system.move_focus(layout, Direction::Left);
-        system.resize_selection_by(layout, 0.12);
+        system.resize_selection_by(layout, 0.12, ResizeOrientation::Horizontal);
 
         let gaps = GapSettings::default();
         let frames = render(&system, layout, screen(1000.0, 800.0), &gaps);
@@ -1903,7 +2202,7 @@ mod tests {
 
         // Make focused-left column wider so selected widths differ across focus moves.
         let _ = system.move_focus(layout, Direction::Left);
-        system.resize_selection_by(layout, 0.15);
+        system.resize_selection_by(layout, 0.15, ResizeOrientation::Horizontal);
 
         let screen = screen(1200.0, 800.0);
         let gaps = GapSettings::default();
@@ -1950,6 +2249,36 @@ mod tests {
     }
 
     #[test]
+    fn consume_or_expel_left_toggles_selected_window_on_left_side() {
+        let (mut system, layout, w1, w2) = setup_two_windows(ScrollingLayoutSettings::default());
+
+        system.consume_or_expel_selection(layout, Direction::Left);
+        let state = system.layouts.get(layout).expect("layout state missing");
+        assert_eq!(state.columns.len(), 1);
+        assert_eq!(state.columns[0].windows, vec![w1, w2]);
+
+        system.consume_or_expel_selection(layout, Direction::Left);
+        let state = system.layouts.get(layout).expect("layout state missing");
+        assert_eq!(state.columns.len(), 2);
+        assert_eq!(state.columns[0].windows, vec![w2]);
+        assert_eq!(state.columns[1].windows, vec![w1]);
+        assert_eq!(state.selected, Some(w2));
+    }
+
+    #[test]
+    fn consume_or_expel_right_expels_selected_window_on_right_side() {
+        let (mut system, layout, w1, w2) = setup_two_windows(ScrollingLayoutSettings::default());
+        system.join_selection_with_direction(layout, Direction::Left);
+
+        system.consume_or_expel_selection(layout, Direction::Right);
+        let state = system.layouts.get(layout).expect("layout state missing");
+        assert_eq!(state.columns.len(), 2);
+        assert_eq!(state.columns[0].windows, vec![w1]);
+        assert_eq!(state.columns[1].windows, vec![w2]);
+        assert_eq!(state.selected, Some(w2));
+    }
+
+    #[test]
     fn niri_rightmost_resize_grow_increases_visible_width() {
         let mut settings = ScrollingLayoutSettings::default();
         settings.alignment = crate::common::config::ScrollingAlignment::Center;
@@ -1966,7 +2295,7 @@ mod tests {
         let before = render(&system, layout, screen, &gaps);
         let before_frame = frame_for(&before, w2);
 
-        system.resize_selection_by(layout, 0.08);
+        system.resize_selection_by(layout, 0.08, ResizeOrientation::Horizontal);
 
         let after = render(&system, layout, screen, &gaps);
         let after_frame = frame_for(&after, w2);
@@ -2012,5 +2341,253 @@ mod tests {
             before.origin.x,
             after.origin.x
         );
+    }
+
+    #[test]
+    fn vertical_resize_adjusts_height_weights_and_calculates_correctly() {
+        let mut system = ScrollingLayoutSystem::new(&ScrollingLayoutSettings::default());
+        let layout = system.create_layout();
+        let w1 = wid(1, 1);
+        let w2 = wid(1, 2);
+        system.add_window_after_selection(layout, w1);
+        system.add_window_after_selection(layout, w2);
+
+        // Join them to the same column
+        system.join_selection_with_direction(layout, Direction::Left);
+
+        let screen = screen(1000.0, 800.0);
+        let gaps = GapSettings::default();
+
+        // 1. Initial layout calculation (should be split equally)
+        let frames_before = render(&system, layout, screen, &gaps);
+        let f1_before = frame_for(&frames_before, w1);
+        let f2_before = frame_for(&frames_before, w2);
+        assert!((f1_before.size.height - f2_before.size.height).abs() < 1.0);
+
+        // 2. Select w1 and resize it
+        assert!(system.select_window(layout, w1));
+        let mut new_f1 = f1_before;
+        new_f1.size.height = f1_before.size.height + 100.0;
+
+        system.on_window_resized(layout, w1, f1_before, new_f1, screen, &gaps);
+
+        // 3. Re-calculate layout and verify resized heights are preserved
+        let frames_after = render(&system, layout, screen, &gaps);
+        let f1_after = frame_for(&frames_after, w1);
+        let f2_after = frame_for(&frames_after, w2);
+
+        assert!((f1_after.size.height - (f1_before.size.height + 100.0)).abs() < 2.0);
+        assert!((f2_after.size.height - (f2_before.size.height - 100.0)).abs() < 2.0);
+        assert!(
+            (f1_after.size.height + f2_after.size.height
+                - (f1_before.size.height + f2_before.size.height))
+                .abs()
+                < 2.0
+        );
+    }
+
+    #[test]
+    fn vertical_resize_command_changes_row_height_without_changing_column_width() {
+        let mut system = ScrollingLayoutSystem::new(&ScrollingLayoutSettings::default());
+        let layout = system.create_layout();
+        let w1 = wid(1, 1);
+        let w2 = wid(1, 2);
+        system.add_window_after_selection(layout, w1);
+        system.add_window_after_selection(layout, w2);
+        system.join_selection_with_direction(layout, Direction::Left);
+        assert!(system.select_window(layout, w1));
+
+        let screen = screen(1000.0, 800.0);
+        let gaps = GapSettings::default();
+        let before = frame_for(&render(&system, layout, screen, &gaps), w1);
+
+        system.resize_selection_by(layout, 0.05, ResizeOrientation::Vertical);
+
+        let after = frame_for(&render(&system, layout, screen, &gaps), w1);
+        assert!(after.size.height > before.size.height);
+        assert!((after.size.width - before.size.width).abs() < 1.0);
+    }
+
+    #[test]
+    fn smart_resize_uses_row_height_for_a_stacked_column() {
+        let mut system = ScrollingLayoutSystem::new(&ScrollingLayoutSettings::default());
+        let layout = system.create_layout();
+        let w1 = wid(1, 1);
+        let w2 = wid(1, 2);
+        system.add_window_after_selection(layout, w1);
+        system.add_window_after_selection(layout, w2);
+        system.join_selection_with_direction(layout, Direction::Left);
+        assert!(system.select_window(layout, w1));
+
+        let screen = screen(1000.0, 800.0);
+        let gaps = GapSettings::default();
+        let before = frame_for(&render(&system, layout, screen, &gaps), w1);
+        system.resize_selection_by(layout, 0.05, ResizeOrientation::Smart);
+        let after = frame_for(&render(&system, layout, screen, &gaps), w1);
+
+        assert!(after.size.height > before.size.height);
+        assert!((after.size.width - before.size.width).abs() < 1.0);
+    }
+
+    #[test]
+    fn niri_new_window_reveal_does_not_unnecessarily_push_offscreen() {
+        let mut settings = ScrollingLayoutSettings::default();
+        settings.alignment = crate::common::config::ScrollingAlignment::Center;
+        settings.focus_navigation_style =
+            crate::common::config::ScrollingFocusNavigationStyle::Niri;
+        settings.column_width_ratio = 0.4;
+        let mut system = ScrollingLayoutSystem::new(&settings);
+        let layout = system.create_layout();
+        let w1 = wid(1, 1);
+        let w2 = wid(1, 2);
+
+        // Add first window
+        system.add_window_after_selection(layout, w1);
+        let screen = screen(1000.0, 800.0);
+        let gaps = GapSettings::default();
+        let _ = render(&system, layout, screen, &gaps);
+        assert_eq!(scroll_offset(&system, layout), 0.0);
+
+        // Add second window
+        system.add_window_after_selection(layout, w2);
+        let frames = render(&system, layout, screen, &gaps);
+        let offset = scroll_offset(&system, layout);
+
+        // Both windows fit on screen (0.4 * 1000 = 400 width each, total 800 width < 1000 screen width).
+        // Since we are in Niri mode, adding a new window w2 to the right of w1
+        // should reveal it, but since w2 already fits fully on screen at offset 0.0
+        // (starts at 400.0, ends at 800.0), the scroll offset should remain 0.0,
+        // keeping both windows on screen!
+        assert_eq!(offset, 0.0);
+
+        let w1_frame = frame_for(&frames, w1);
+        let w2_frame = frame_for(&frames, w2);
+        assert!(w1_frame.origin.x >= 0.0);
+        assert!(w2_frame.origin.x + w2_frame.size.width <= 1000.0);
+    }
+
+    #[test]
+    fn anchored_alignments_adjust_outer_columns() {
+        let screen = screen(1000.0, 800.0);
+        let gaps = GapSettings::default();
+
+        // Test Left Alignment: last column is anchored to the right.
+        {
+            let mut settings = ScrollingLayoutSettings::default();
+            settings.alignment = crate::common::config::ScrollingAlignment::Left;
+            settings.focus_navigation_style =
+                crate::common::config::ScrollingFocusNavigationStyle::Anchored;
+            settings.column_width_ratio = 0.4;
+            let mut system = ScrollingLayoutSystem::new(&settings);
+            let layout = system.create_layout();
+            let w1 = wid(1, 1);
+            let w2 = wid(1, 2);
+            let w3 = wid(1, 3);
+            system.add_window_after_selection(layout, w1);
+            system.add_window_after_selection(layout, w2);
+            system.add_window_after_selection(layout, w3);
+
+            assert!(system.select_window(layout, w1));
+            let w1_frame = frame_for(&render(&system, layout, screen, &gaps), w1);
+            assert!((w1_frame.origin.x - 0.0).abs() < 1.0); // left-aligned
+
+            assert!(system.select_window(layout, w2));
+            let w2_frame = frame_for(&render(&system, layout, screen, &gaps), w2);
+            assert!((w2_frame.origin.x - 0.0).abs() < 1.0); // left-aligned
+
+            assert!(system.select_window(layout, w3));
+            let w3_frame = frame_for(&render(&system, layout, screen, &gaps), w3);
+            assert!((w3_frame.origin.x - 600.0).abs() < 1.0); // right-aligned
+        }
+
+        // Test Right Alignment: first column is anchored to the left.
+        {
+            let mut settings = ScrollingLayoutSettings::default();
+            settings.alignment = crate::common::config::ScrollingAlignment::Right;
+            settings.focus_navigation_style =
+                crate::common::config::ScrollingFocusNavigationStyle::Anchored;
+            settings.column_width_ratio = 0.4;
+            let mut system = ScrollingLayoutSystem::new(&settings);
+            let layout = system.create_layout();
+            let w1 = wid(1, 1);
+            let w2 = wid(1, 2);
+            let w3 = wid(1, 3);
+            system.add_window_after_selection(layout, w1);
+            system.add_window_after_selection(layout, w2);
+            system.add_window_after_selection(layout, w3);
+
+            assert!(system.select_window(layout, w1));
+            let w1_frame = frame_for(&render(&system, layout, screen, &gaps), w1);
+            assert!((w1_frame.origin.x - 0.0).abs() < 1.0); // left-aligned
+
+            assert!(system.select_window(layout, w2));
+            let w2_frame = frame_for(&render(&system, layout, screen, &gaps), w2);
+            assert!((w2_frame.origin.x - 600.0).abs() < 1.0); // right-aligned
+
+            assert!(system.select_window(layout, w3));
+            let w3_frame = frame_for(&render(&system, layout, screen, &gaps), w3);
+            assert!((w3_frame.origin.x - 600.0).abs() < 1.0); // right-aligned
+        }
+
+        // Test Center Alignment: first column is left-anchored, last is right-anchored, middle is centered.
+        {
+            let mut settings = ScrollingLayoutSettings::default();
+            settings.alignment = crate::common::config::ScrollingAlignment::Center;
+            settings.focus_navigation_style =
+                crate::common::config::ScrollingFocusNavigationStyle::Anchored;
+            settings.column_width_ratio = 0.4;
+            let mut system = ScrollingLayoutSystem::new(&settings);
+            let layout = system.create_layout();
+            let w1 = wid(1, 1);
+            let w2 = wid(1, 2);
+            let w3 = wid(1, 3);
+            system.add_window_after_selection(layout, w1);
+            system.add_window_after_selection(layout, w2);
+            system.add_window_after_selection(layout, w3);
+
+            assert!(system.select_window(layout, w1));
+            let w1_frame = frame_for(&render(&system, layout, screen, &gaps), w1);
+            assert!((w1_frame.origin.x - 0.0).abs() < 1.0); // left-aligned
+
+            assert!(system.select_window(layout, w2));
+            let w2_frame = frame_for(&render(&system, layout, screen, &gaps), w2);
+            assert!((w2_frame.origin.x - 300.0).abs() < 1.0); // centered
+
+            assert!(system.select_window(layout, w3));
+            let w3_frame = frame_for(&render(&system, layout, screen, &gaps), w3);
+            assert!((w3_frame.origin.x - 600.0).abs() < 1.0); // right-aligned
+        }
+    }
+
+    #[test]
+    fn single_column_fills_full_width() {
+        let mut settings = ScrollingLayoutSettings::default();
+        settings.column_width_ratio = 0.4;
+        let mut system = ScrollingLayoutSystem::new(&settings);
+        let layout = system.create_layout();
+        let w1 = wid(1, 1);
+
+        system.add_window_after_selection(layout, w1);
+
+        let screen = screen(1000.0, 800.0);
+        let gaps = GapSettings::default();
+        let frames1 = render(&system, layout, screen, &gaps);
+        let w1_frame1 = frame_for(&frames1, w1);
+
+        // With only 1 column, width should be 100% of tiling width (1000.0)
+        assert!((w1_frame1.size.width - 1000.0).abs() < 1.0);
+        assert!((w1_frame1.origin.x - 0.0).abs() < 1.0);
+
+        // Add a second window (w2)
+        let w2 = wid(1, 2);
+        system.add_window_after_selection(layout, w2);
+
+        let frames2 = render(&system, layout, screen, &gaps);
+        let w1_frame2 = frame_for(&frames2, w1);
+        let w2_frame2 = frame_for(&frames2, w2);
+
+        // With 2 columns, they should respect the configured column_width_ratio (0.4 * 1000 = 400.0)
+        assert!((w1_frame2.size.width - 400.0).abs() < 1.0);
+        assert!((w2_frame2.size.width - 400.0).abs() < 1.0);
     }
 }

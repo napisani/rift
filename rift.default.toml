@@ -66,10 +66,11 @@ hot_reload = true
 
 [settings.layout]
 # Layout Types:
-# 	- "traditional" (i3/sway-like containers)
-#	- "bsp" (binary space partitioning),
+#   - "traditional" (i3/sway-like containers)
+#   - "bsp" (binary space partitioning)
 #   - "stack" (single stacked container)
 #   - "master_stack" (master area + stack area)
+#   - "scrolling" (niri-like)
 # defaults to "traditional" if omitted
 #
 # This is the default layout mode if there is nothing else configured
@@ -87,6 +88,12 @@ master_count = 1
 master_side = "left"
 # Where new windows go when the master area is already full (master | stack | focused)
 new_window_placement = "master"
+# Orientation arrangement for the master area (horizontal | vertical)
+# If omitted, defaults to the direction perpendicular to master_side's split
+# master_arrangement = "vertical"
+# Orientation arrangement for the stack area (horizontal | vertical)
+# If omitted, defaults to the direction perpendicular to master_side's split
+# stack_arrangement = "vertical"
 
 # these settings only apply when layout mode == "scrolling"
 [settings.layout.scrolling]
@@ -114,6 +121,9 @@ invert_horizontal = false
 # Number of fingers required for gesture
 fingers = 3
 # If true, scrolling past the end of the strip will trigger a workspace switch
+#
+# This enables a seemingly endless scroll experience through each workspace's
+# strip of windows
 propagate_to_workspace_swipe = false
 
 [settings.layout.stack]
@@ -172,10 +182,14 @@ active_label = "index"
 # when displaying workspaces, choose whether to draw the layout preview or a set of labels
 # options are "layout" or "label"
 display_style = "layout"
+# .ron files in this folder appear under Layout Files in the menu bar
+layout_folder = "~/.config/rift/layouts"
 
 [settings.ui.stack_line]
 # experimental stack line indicator (defaults to off)
 enabled = false
+# action on hover: "click" or "hover" (defaults to "hover" which is just a visual indicator)
+hover = "hover"
 # in a horizontal stack where the line will be (top/bottom)
 horiz_placement = "top"
 # in a vertical stack where the line will be (left/right)
@@ -197,6 +211,9 @@ fade_duration_ms = 180.0
 [settings.gestures]
 # Enable horizontal swipes to switch virtual workspaces
 enabled = false
+# If true, Rift consumes low-level dock swipe events for its trackpad gesture handlers
+# to prevent interference with rift's own swipe detection
+consume_dock_swipe = true
 # Invert horizontal direction (swap next/prev)
 invert_horizontal_swipe = false
 # Maximum vertical travel allowed for the horizontal swipe to register.
@@ -229,12 +246,15 @@ drag_swap_fraction = 0.3
 # - preserve_focus_per_workspace: remember last focused window per workspace
 # - workspace_auto_back_and_forth: when enabled, if you try to switch to the same workspace
 #   that's already active, it will switch to the last workspace instead
+# - prevent_wrapping: when true, next/previous workspace switching stops at the first/last
+#   workspace instead of wrapping around
 # - reapply_app_rules_on_title_change: if true, app rules are re-evaluated when a window's title changes
 enabled = true
 default_workspace_count = 4
 auto_assign_windows = true
 preserve_focus_per_workspace = true
 workspace_auto_back_and_forth = false
+prevent_wrapping = false
 reapply_app_rules_on_title_change = false
 
 # Workspace-specific rules
@@ -342,11 +362,14 @@ comb1 = "Alt + Shift"
 
 # Commands
 # - toggle_space_activated
+# - reload_config
 # - next_workspace / prev_workspace
 # - next_workspace = true|false (optional skip-empty override)
 # - prev_workspace = true|false (optional skip-empty override)
 # - switch_to_workspace = N
-# - move_window_to_workspace = N / move_window_to_workspace = { workspace = N, window_id = 123 } (optional window id)
+# - move_window_to_workspace = N|"next"|"prev"
+# - move_window_to_workspace = { workspace = N|"next"|"prev", follow = true|false, window_id = 123 }
+#   (follow and window_id are optional)
 # - create_workspace
 # - switch_to_last_workspace
 # - set_workspace_layout = { mode = "traditional"|"bsp"|"stack"|"master_stack"|"scrolling" } (active workspace)
@@ -356,14 +379,17 @@ comb1 = "Alt + Shift"
 # - move_focus = "left"|"right"|"up"|"down"
 # - move_node = "left"|"right"|"up"|"down"
 # - join_window = "left"|"right"|"up"|"down"
+# - consume_or_expel_window = "left"|"right"|"up"|"down"
 # - toggle_stack / toggle_orientation / unjoin_windows
 # - toggle_focus_floating / toggle_window_floating / toggle_fullscreen / toggle_fullscreen_within_gaps
-# - resize_window_grow / resize_window_shrink / resize_window_by = 0.05
+# - resize_window_grow / resize_window_shrink (without param, horizontal is default)
+# - resize_window_grow = "horizontal"|"vertical"|"smart"
+# - resize_window_shrink = "horizontal"|"vertical"|"smart"
 # - swap_windows = [123, 456]
 # - exec = "command" | exec = ["cmd", "arg1", "..."]
 # - move_mouse_to_display = "left"|"right"|"up"|"down"|N|"<display_uuid>"
 # - move_window_to_display = { selector = "left"|"right"|"up"|"down"|N|"<display_uuid>", window_id = 123 }
-# - close_window = { window_server_id = 123 }
+# - close_window / close_window = { window_server_id = 123 } (optional window id)
 # - focus_window = { window_id = 123, window_server_id = 456 }
 # - show_mission_control_all / show_mission_control_current / dismiss_mission_control (this is rift's own mission control, not macOS's)
 
@@ -421,6 +447,10 @@ comb1 = "Alt + Shift"
 # smartly resize windows
 "Alt + Shift + Equal" = "resize_window_grow"
 "Alt + Shift + Minus" = "resize_window_shrink"
+# Example vertical bindings for windows stacked in a scrolling-layout column:
+# "Alt + Ctrl + Equal" = { resize_window_grow = "vertical" }
+# "Alt + Ctrl + Minus" = { resize_window_shrink = "vertical" }
+# Use "smart" to resize the nearest applicable split automatically.
 
 # Move mouse cursor to display by index (0-based) or UUID
 # Examples:

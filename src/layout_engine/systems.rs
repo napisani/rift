@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::actor::app::{WindowId, pid_t};
 use crate::common::collections::HashMap;
-use crate::layout_engine::{Direction, LayoutKind};
+use crate::layout_engine::{Direction, LayoutKind, ResizeOrientation};
 
 slotmap::new_key_type! { pub struct LayoutId; }
 
@@ -90,6 +90,7 @@ impl WindowLayoutConstraints {
 #[enum_dispatch]
 pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
     fn create_layout(&mut self) -> LayoutId;
+    fn contains_layout(&self, layout: LayoutId) -> bool;
     fn clone_layout(&mut self, layout: LayoutId) -> LayoutId;
     fn remove_layout(&mut self, layout: LayoutId);
 
@@ -108,6 +109,10 @@ pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
     ) -> Vec<(WindowId, CGRect)>;
 
     fn selected_window(&self, layout: LayoutId) -> Option<WindowId>;
+    /// Return every window stored in this layout, including members hidden by a stack.
+    /// Persistence validation must not confuse "currently visible" with "serialized" or an
+    /// unmatchable hidden member can survive forever as a ghost.
+    fn all_windows_in_layout(&self, layout: LayoutId) -> Vec<WindowId>;
     fn visible_windows_in_layout(&self, layout: LayoutId) -> Vec<WindowId>;
     fn visible_windows_under_selection(&self, layout: LayoutId) -> Vec<WindowId>;
     fn ascend_selection(&mut self, layout: LayoutId) -> bool;
@@ -119,7 +124,10 @@ pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
     ) -> (Option<WindowId>, Vec<WindowId>);
     fn window_in_direction(&self, layout: LayoutId, direction: Direction) -> Option<WindowId>;
     fn add_window_after_selection(&mut self, layout: LayoutId, wid: WindowId);
+    /// Replace a window identity in-place without changing its layout position.
+    fn replace_window(&mut self, from: WindowId, to: WindowId);
     fn remove_window(&mut self, wid: WindowId);
+    fn remove_window_and_rebalance_parent(&mut self, wid: WindowId) { self.remove_window(wid) }
     fn remove_windows_for_app(&mut self, pid: pid_t);
     fn windows_for_app(&self, layout: LayoutId, pid: pid_t) -> Vec<WindowId>;
     fn set_windows_for_app(&mut self, layout: LayoutId, pid: pid_t, desired: Vec<WindowId>);
@@ -151,6 +159,9 @@ pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
     fn has_any_fullscreen_node(&self, layout: LayoutId) -> bool;
 
     fn join_selection_with_direction(&mut self, layout: LayoutId, direction: Direction);
+    fn consume_or_expel_selection(&mut self, layout: LayoutId, direction: Direction) {
+        self.join_selection_with_direction(layout, direction);
+    }
     fn apply_stacking_to_parent_of_selection(
         &mut self,
         layout: LayoutId,
@@ -163,7 +174,12 @@ pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
     ) -> Vec<WindowId>;
     fn parent_of_selection_is_stacked(&self, layout: LayoutId) -> bool;
     fn unjoin_selection(&mut self, _layout: LayoutId);
-    fn resize_selection_by(&mut self, layout: LayoutId, amount: f64);
+    fn resize_selection_by(
+        &mut self,
+        layout: LayoutId,
+        amount: f64,
+        orientation: ResizeOrientation,
+    );
     fn rebalance(&mut self, layout: LayoutId);
     fn toggle_tile_orientation(&mut self, layout: LayoutId);
 }
@@ -266,7 +282,7 @@ mod stack;
 pub use stack::StackLayoutSystem;
 
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 #[derive(Debug)]
 #[enum_dispatch(LayoutSystem)]
 pub enum LayoutSystemKind {
