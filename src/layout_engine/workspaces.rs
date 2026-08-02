@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use super::{LayoutId, LayoutSystem};
 use crate::sys::screen::SpaceId;
 
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub(crate) struct WorkspaceLayouts {
     map: crate::common::collections::HashMap<
         (SpaceId, crate::model::VirtualWorkspaceId),
@@ -12,12 +12,16 @@ pub(crate) struct WorkspaceLayouts {
     >,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct SpaceLayoutInfo {
     configurations: crate::common::collections::HashMap<Size, LayoutId>,
     active_size: Size,
     last_saved: Option<LayoutId>,
 }
+
+/// Opaque workspace-layout payload used by transactional restore code.
+/// Keeping `SpaceLayoutInfo` private prevents persistence from depending on its internal maps.
+pub(crate) struct WorkspaceLayoutSnapshot(SpaceLayoutInfo);
 
 impl SpaceLayoutInfo {
     fn active(&self) -> Option<LayoutId> { self.configurations.get(&self.active_size).copied() }
@@ -39,6 +43,78 @@ impl From<CGSize> for Size {
 }
 
 impl WorkspaceLayouts {
+    pub(crate) fn validate_persisted(
+        &self,
+        workspaces: &crate::model::WorkspaceStore,
+    ) -> Result<(), String> {
+        for (&(space, workspace), info) in &self.map {
+            let Some(workspace_info) = workspaces.workspaces.get(workspace) else {
+                return Err(format!(
+                    "layout state references missing workspace {workspace:?}"
+                ));
+            };
+            if workspace_info.space != space {
+                return Err(format!(
+                    "layout for workspace {workspace:?} is stored under native space {} instead of {}",
+                    space.get(),
+                    workspace_info.space.get()
+                ));
+            }
+            if info.configurations.is_empty() {
+                return Err(format!("workspace {workspace:?} has no layout configurations"));
+            }
+            if !info.configurations.contains_key(&info.active_size) {
+                return Err(format!(
+                    "workspace {workspace:?} has no configuration for its active display size"
+                ));
+            }
+            for layout in info.configurations.values().copied().chain(info.last_saved) {
+                if !workspace_info.layout_system.contains_layout(layout) {
+                    return Err(format!(
+                        "workspace {workspace:?} references missing layout {layout:?}"
+                    ));
+                }
+            }
+        }
+
+        for space in workspaces.initialized_spaces() {
+            for (workspace, _) in workspaces.existing_workspaces(space) {
+                if !self.map.contains_key(&(space, workspace)) {
+                    return Err(format!(
+                        "workspace {workspace:?} on native space {} has no layout state",
+                        space.get()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn snapshot_workspace(
+        &self,
+        space: SpaceId,
+        workspace: crate::model::VirtualWorkspaceId,
+    ) -> Option<WorkspaceLayoutSnapshot> {
+        self.map.get(&(space, workspace)).cloned().map(WorkspaceLayoutSnapshot)
+    }
+
+    pub(crate) fn install_workspace_snapshot(
+        &mut self,
+        space: SpaceId,
+        workspace: crate::model::VirtualWorkspaceId,
+        snapshot: WorkspaceLayoutSnapshot,
+    ) {
+        self.map.insert((space, workspace), snapshot.0);
+    }
+
+    pub(crate) fn contains_workspace(
+        &self,
+        space: SpaceId,
+        workspace: crate::model::VirtualWorkspaceId,
+    ) -> bool {
+        self.map.contains_key(&(space, workspace))
+    }
+
     pub(crate) fn ensure_active_for_space(
         &mut self,
         space: SpaceId,
@@ -149,7 +225,8 @@ impl WorkspaceLayouts {
         &self,
         space: SpaceId,
     ) -> Vec<(crate::model::VirtualWorkspaceId, LayoutId)> {
-        self.map
+        let mut layouts = self
+            .map
             .iter()
             .filter_map(|(&(sp, ws), info)| {
                 if sp == space {
@@ -158,7 +235,39 @@ impl WorkspaceLayouts {
                     None
                 }
             })
-            .collect()
+            .collect::<Vec<_>>();
+        layouts.sort_unstable();
+        layouts
+    }
+
+    /// Enumerate every serialized layout configuration, not only the currently active display
+    /// size. Old-size configurations are restored later and therefore must be sanitized too.
+    pub(crate) fn all_layouts(&self) -> Vec<(SpaceId, crate::model::VirtualWorkspaceId, LayoutId)> {
+        let mut layouts = Vec::new();
+        for (&(space, workspace), info) in &self.map {
+            layouts.extend(info.configurations.values().map(|layout| (space, workspace, *layout)));
+            if let Some(layout) = info.last_saved {
+                layouts.push((space, workspace, layout));
+            }
+        }
+        layouts.sort_unstable();
+        layouts.dedup();
+        layouts
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_layout_configuration_for_test(
+        &mut self,
+        space: SpaceId,
+        workspace: crate::model::VirtualWorkspaceId,
+        size: CGSize,
+        layout: LayoutId,
+    ) {
+        self.map
+            .get_mut(&(space, workspace))
+            .expect("test workspace must be initialized")
+            .configurations
+            .insert(Size::from(size), layout);
     }
 
     pub(crate) fn ensure_active_for_workspace(

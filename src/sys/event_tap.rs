@@ -1,5 +1,4 @@
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use objc2_core_foundation::{
     CFMachPort, CFRetained, CFRunLoop, CFRunLoopMode, CFRunLoopSource, kCFRunLoopCommonModes,
@@ -8,7 +7,7 @@ use objc2_core_graphics::{
     CGEvent, CGEventMask, CGEventTapLocation as CGTapLoc, CGEventTapOptions as CGTapOpt,
     CGEventTapPlacement as CGTapPlace, CGEventTapProxy, CGEventType,
 };
-use tracing::debug;
+use tracing::{debug, error, warn};
 
 pub type TapCallback = Option<
     unsafe extern "C-unwind" fn(
@@ -19,12 +18,28 @@ pub type TapCallback = Option<
     ) -> *mut CGEvent,
 >;
 
+pub type TapReenabledCallback = Option<unsafe extern "C-unwind" fn(*mut c_void)>;
+pub type TapInvalidatedCallback = Option<unsafe extern "C-unwind" fn(*mut c_void)>;
+
 struct TrampolineCtx {
     callback: TapCallback,
     original_user_info: *mut c_void,
     original_drop: Option<unsafe fn(*mut c_void)>,
+    reenabled_callback: TapReenabledCallback,
+    invalidated_callback: TapInvalidatedCallback,
     port_ptr: Option<core::ptr::NonNull<CFMachPort>>,
-    was_reenabled: AtomicBool,
+}
+
+extern "C-unwind" fn port_invalidated(_port: *mut CFMachPort, user_info: *mut c_void) {
+    if user_info.is_null() {
+        return;
+    }
+
+    let ctx = unsafe { &*(user_info as *const TrampolineCtx) };
+    warn!("Event tap Mach port was invalidated; scheduling tap recreation");
+    if let Some(callback) = ctx.invalidated_callback {
+        unsafe { callback(ctx.original_user_info) };
+    }
 }
 
 extern "C-unwind" fn trampoline_callback(
@@ -43,8 +58,20 @@ extern "C-unwind" fn trampoline_callback(
     let ety = etype.0 as i32;
     if ety == -1 || ety == -2 {
         if let Some(port_ptr) = ctx.port_ptr {
-            unsafe { CGEvent::tap_enable(port_ptr.as_ref(), true) };
-            ctx.was_reenabled.store(true, Ordering::Release);
+            let port = unsafe { port_ptr.as_ref() };
+            let reason = if ety == -2 { "timeout" } else { "user input" };
+            warn!(reason, "Event tap was disabled; re-enabling it");
+            CGEvent::tap_enable(port, true);
+            if CGEvent::tap_is_enabled(port) {
+                if let Some(callback) = ctx.reenabled_callback {
+                    unsafe { callback(ctx.original_user_info) };
+                }
+            } else {
+                error!(reason, "Event tap did not re-enable; scheduling tap recreation");
+                if let Some(callback) = ctx.invalidated_callback {
+                    unsafe { callback(ctx.original_user_info) };
+                }
+            }
         }
 
         return event_ref.as_ptr();
@@ -78,20 +105,23 @@ pub struct EventTap {
 }
 
 impl EventTap {
-    pub unsafe fn new_at_location_with_options(
+    unsafe fn create(
         location: CGTapLoc,
         options: CGTapOpt,
         mask: CGEventMask,
         callback: TapCallback,
         user_info: *mut c_void,
         drop_ctx: Option<unsafe fn(*mut c_void)>,
+        reenabled_callback: TapReenabledCallback,
+        invalidated_callback: TapInvalidatedCallback,
     ) -> Option<Self> {
         let tramp = Box::new(TrampolineCtx {
             callback,
             original_user_info: user_info,
             original_drop: drop_ctx,
+            reenabled_callback,
+            invalidated_callback,
             port_ptr: None,
-            was_reenabled: AtomicBool::new(false),
         });
         let tramp_ptr = Box::into_raw(tramp) as *mut c_void;
 
@@ -132,9 +162,25 @@ impl EventTap {
         unsafe {
             let tramp_ctx = &mut *(tramp_ptr as *mut TrampolineCtx);
             tramp_ctx.port_ptr = Some(core::ptr::NonNull::from(&*event_tap.port));
+            event_tap.port.set_invalidation_call_back(Some(port_invalidated));
         }
 
         Some(event_tap)
+    }
+
+    pub unsafe fn new_at_location_with_options(
+        location: CGTapLoc,
+        options: CGTapOpt,
+        mask: CGEventMask,
+        callback: TapCallback,
+        user_info: *mut c_void,
+        drop_ctx: Option<unsafe fn(*mut c_void)>,
+    ) -> Option<Self> {
+        unsafe {
+            Self::create(
+                location, options, mask, callback, user_info, drop_ctx, None, None,
+            )
+        }
     }
 
     pub unsafe fn new_with_options(
@@ -152,6 +198,31 @@ impl EventTap {
                 callback,
                 user_info,
                 drop_ctx,
+            )
+        }
+    }
+
+    /// Creates a session event tap that invokes `reenabled_callback` immediately
+    /// after Core Graphics reports and the trampoline recovers a disabled tap.
+    pub unsafe fn new_with_options_and_recovery_callbacks(
+        options: CGTapOpt,
+        mask: CGEventMask,
+        callback: TapCallback,
+        user_info: *mut c_void,
+        drop_ctx: Option<unsafe fn(*mut c_void)>,
+        reenabled_callback: TapReenabledCallback,
+        invalidated_callback: TapInvalidatedCallback,
+    ) -> Option<Self> {
+        unsafe {
+            Self::create(
+                CGTapLoc::SessionEventTap,
+                options,
+                mask,
+                callback,
+                user_info,
+                drop_ctx,
+                reenabled_callback,
+                invalidated_callback,
             )
         }
     }
@@ -185,21 +256,16 @@ impl EventTap {
     }
 
     pub fn set_enabled(&self, enabled: bool) { CGEvent::tap_enable(&self.port, enabled); }
-
-    /// Returns `true` if the tap was re-enabled since the last call, and
-    /// atomically clears the flag. Used by the actor layer to detect that
-    /// key-up events may have been lost while the tap was disabled.
-    pub fn take_reenabled_flag(&self) -> bool {
-        // SAFETY: self.user_info was created by new_with_options and always
-        // points to a live TrampolineCtx as long as this EventTap exists.
-        let ctx = unsafe { &*(self.user_info as *const TrampolineCtx) };
-        ctx.was_reenabled.swap(false, Ordering::AcqRel)
-    }
 }
 
 impl Drop for EventTap {
     fn drop(&mut self) {
-        CGEvent::tap_enable(&self.port, false);
+        if self.port.is_valid() {
+            // Intentional teardown/replacement must not be mistaken for an
+            // unexpected Mach-port failure by the event-driven recovery path.
+            unsafe { self.port.set_invalidation_call_back(None) };
+            CGEvent::tap_enable(&self.port, false);
+        }
         if let Some(rl) = CFRunLoop::current() {
             rl.remove_source(Some(&self.source), unsafe { kCFRunLoopCommonModes });
         }

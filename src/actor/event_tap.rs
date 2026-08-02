@@ -19,16 +19,13 @@ use std::cell::{Cell, RefCell};
 use std::panic::AssertUnwindSafe;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use objc2_core_foundation::{CGPoint, CGRect};
 use objc2_core_graphics::{
-    CGEvent, CGEventField, CGEventFlags, CGEventMask, CGEventTapOptions as CGTapOpt,
-    CGEventTapProxy, CGEventType,
+    CGEvent, CGEventField, CGEventFlags, CGEventMask, CGEventSource, CGEventSourceStateID,
+    CGEventTapOptions as CGTapOpt, CGEventTapProxy, CGEventType,
 };
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, trace, warn};
 
 use super::reactor::{self, Event};
@@ -37,7 +34,7 @@ use crate::actor;
 use crate::actor::spaces::ForwardedSpaceState;
 use crate::actor::wm_controller::{self, WmCommand, WmEvent};
 use crate::common::collections::{HashMap, HashSet};
-use crate::common::config::{Config, LayoutMode};
+use crate::common::config::{Config, LayoutMode, StackLineHoverMode};
 use crate::sys::event::{self, Hotkey, KeyCode, MouseState, set_mouse_state};
 use crate::sys::hotkey::{
     Modifiers, is_modifier_key, key_code_from_event, modifier_key_is_active,
@@ -74,6 +71,7 @@ pub struct EventTap {
     mouse_move_min_interval_ns: Cell<u64>,
     mouse_window: Cell<MouseWindow>,
     tap: RefCell<Option<crate::sys::event_tap::EventTap>>,
+    tap_generation: Cell<u64>,
     disable_hotkey: RefCell<Option<Hotkey>>,
     hotkey_specs: RefCell<Vec<(String, WmCommand)>>,
     hotkeys: SharedHotkeyTable,
@@ -98,6 +96,7 @@ struct State {
     event_processing_enabled: bool,
     focus_follows_mouse_enabled: bool,
     stack_line_enabled: bool,
+    stack_line_hover_mode: StackLineHoverMode,
     disable_hotkey_active: bool,
     low_power_mode: bool,
     pressed_keys: HashSet<KeyCode>,
@@ -126,6 +125,7 @@ impl Default for State {
             event_processing_enabled: false,
             focus_follows_mouse_enabled: true,
             stack_line_enabled: false,
+            stack_line_hover_mode: StackLineHoverMode::default(),
             disable_hotkey_active: false,
             low_power_mode: power::is_low_power_mode_enabled(),
             pressed_keys: HashSet::default(),
@@ -144,6 +144,13 @@ pub type SharedHotkeyTable = Arc<ArcSwap<HashMap<Hotkey, Vec<WmCommand>>>>;
 
 struct CallbackCtx {
     this: Arc<EventTap>,
+    recovery_tx: tokio::sync::mpsc::UnboundedSender<Recovery>,
+    tap_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Recovery {
+    TapInvalidated(u64),
 }
 
 unsafe fn drop_mouse_ctx(ptr: *mut std::ffi::c_void) {
@@ -180,17 +187,25 @@ impl EventTap {
     fn create_tap_with_mask(
         self: &Arc<Self>,
         mask: CGEventMask,
+        recovery_tx: tokio::sync::mpsc::UnboundedSender<Recovery>,
     ) -> Option<crate::sys::event_tap::EventTap> {
-        let ctx = Box::new(CallbackCtx { this: Arc::clone(self) });
+        let tap_generation = self.tap_generation.get().wrapping_add(1);
+        let ctx = Box::new(CallbackCtx {
+            this: Arc::clone(self),
+            recovery_tx,
+            tap_generation,
+        });
         let ctx_ptr = Box::into_raw(ctx) as *mut std::ffi::c_void;
 
         let tap = unsafe {
-            crate::sys::event_tap::EventTap::new_with_options(
+            crate::sys::event_tap::EventTap::new_with_options_and_recovery_callbacks(
                 CGTapOpt::Default,
                 mask,
                 Some(mouse_callback),
                 ctx_ptr,
                 Some(drop_mouse_ctx),
+                Some(event_tap_reenabled),
+                Some(event_tap_invalidated),
             )
         };
 
@@ -198,16 +213,22 @@ impl EventTap {
             unsafe { drop(Box::from_raw(ctx_ptr as *mut CallbackCtx)) };
         }
 
+        if tap.is_some() {
+            self.tap_generation.set(tap_generation);
+        }
         tap
     }
 
-    fn rebuild_event_tap_mask_if_needed(self: &Arc<Self>) {
+    fn rebuild_event_tap_mask_if_needed(
+        self: &Arc<Self>,
+        recovery_tx: &tokio::sync::mpsc::UnboundedSender<Recovery>,
+    ) {
         let next_mask = self.desired_event_mask();
         if next_mask == self.event_mask.get() {
             return;
         }
 
-        let Some(new_tap) = self.create_tap_with_mask(next_mask) else {
+        let Some(new_tap) = self.create_tap_with_mask(next_mask, recovery_tx.clone()) else {
             warn!("Failed to rebuild event tap with updated mask");
             return;
         };
@@ -215,6 +236,28 @@ impl EventTap {
         let old_tap = self.tap.borrow_mut().replace(new_tap);
         drop(old_tap);
         self.event_mask.set(next_mask);
+    }
+
+    fn rebuild_invalidated_event_tap(
+        self: &Arc<Self>,
+        generation: u64,
+        recovery_tx: &tokio::sync::mpsc::UnboundedSender<Recovery>,
+    ) {
+        if generation != self.tap_generation.get() {
+            debug!(generation, "Ignoring invalidation from a replaced event tap");
+            return;
+        }
+
+        let mask = self.event_mask.get();
+        let Some(new_tap) = self.create_tap_with_mask(mask, recovery_tx.clone()) else {
+            error!(generation, "Failed to recreate invalidated event tap");
+            return;
+        };
+
+        let old_tap = self.tap.borrow_mut().replace(new_tap);
+        drop(old_tap);
+        self.reconcile_after_tap_reenabled();
+        warn!(generation, "Recreated invalidated event tap");
     }
 
     pub fn new(
@@ -234,6 +277,7 @@ impl EventTap {
         state.mouse_hides_on_focus = config.settings.mouse_hides_on_focus;
         state.focus_follows_mouse_config_enabled = config.settings.focus_follows_mouse;
         state.stack_line_enabled = config.settings.ui.stack_line.enabled;
+        state.stack_line_hover_mode = config.settings.ui.stack_line.hover;
         state.default_layout_mode = config.settings.layout.mode;
         state.disable_hotkey_active = disable_hotkey
             .as_ref()
@@ -254,6 +298,7 @@ impl EventTap {
             mouse_move_min_interval_ns: Cell::new(mouse_move_min_interval_ns),
             mouse_window: Cell::new(MouseWindow::default()),
             tap: RefCell::new(None),
+            tap_generation: Cell::new(0),
             disable_hotkey: RefCell::new(disable_hotkey),
             hotkey_specs: RefCell::new(Vec::new()),
             hotkeys: Arc::new(ArcSwap::from_pointee(HashMap::default())),
@@ -264,21 +309,13 @@ impl EventTap {
     }
 
     pub async fn run(mut self) {
-        use tracing::Span;
-
-        use crate::sys::timer::Timer;
-
-        enum Tick {
-            Request(Request),
-            Watchdog,
-        }
-
-        let requests_rx = self.requests_rx.take().unwrap();
+        let mut requests_rx = self.requests_rx.take().unwrap();
+        let (recovery_tx, mut recovery_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let this = Arc::new(self);
 
         let mask = this.event_mask.get();
-        let tap = this.create_tap_with_mask(mask);
+        let tap = this.create_tap_with_mask(mask, recovery_tx.clone());
 
         if let Some(tap) = tap {
             *this.tap.borrow_mut() = Some(tap);
@@ -295,40 +332,30 @@ impl EventTap {
             }
         }
 
-        let watchdog = Timer::repeating(Duration::from_secs(5), Duration::from_secs(5));
-
-        let mut merged = StreamExt::merge(
-            UnboundedReceiverStream::new(requests_rx).map(|(span, req)| (span, Tick::Request(req))),
-            watchdog.map(|()| (Span::none(), Tick::Watchdog)),
-        );
-
-        while let Some((span, tick)) = merged.next().await {
-            let _guard = span.enter();
-            match tick {
-                Tick::Request(request) => this.on_request(request),
-                Tick::Watchdog => {
-                    let tap_enabled = this.tap.borrow().is_some();
-                    if let Some(tap) = this.tap.borrow().as_ref() {
-                        tap.set_enabled(true);
+        loop {
+            tokio::select! {
+                maybe_recovery = recovery_rx.recv() => {
+                    let Some(recovery) = maybe_recovery else { break };
+                    match recovery {
+                        Recovery::TapInvalidated(generation) => {
+                            this.rebuild_invalidated_event_tap(generation, &recovery_tx);
+                        }
                     }
-                    // Full modifier reconciliation: prune any pressed_keys not
-                    // reflected in the last known flags.
-                    let mut state = this.state.borrow_mut();
-                    state.reconcile_modifier_keys();
-                    trace!(
-                        tap_enabled,
-                        event_mask = this.event_mask.get(),
-                        pressed_keys = state.pressed_keys.len(),
-                        disable_hotkey_active = state.disable_hotkey_active,
-                        event_processing = state.event_processing_enabled,
-                        "watchdog tick"
-                    );
+                }
+                maybe_request = requests_rx.recv() => {
+                    let Some((span, request)) = maybe_request else { break };
+                    let _guard = span.enter();
+                    this.on_request(request, &recovery_tx);
                 }
             }
         }
     }
 
-    fn on_request(self: &Arc<Self>, request: Request) {
+    fn on_request(
+        self: &Arc<Self>,
+        request: Request,
+        recovery_tx: &tokio::sync::mpsc::UnboundedSender<Recovery>,
+    ) {
         let mut should_rebuild_mask = false;
         let mut state = self.state.borrow_mut();
         match request {
@@ -391,6 +418,7 @@ impl EventTap {
                 let mouse_hides_on_focus = new_config.settings.mouse_hides_on_focus;
                 let focus_follows_mouse_config_enabled = new_config.settings.focus_follows_mouse;
                 let stack_line_enabled = new_config.settings.ui.stack_line.enabled;
+                let stack_line_hover_mode = new_config.settings.ui.stack_line.hover;
                 let default_layout_mode = new_config.settings.layout.mode;
                 let disable_hotkey = new_config
                     .settings
@@ -403,9 +431,11 @@ impl EventTap {
                     let prev_focus_follows_mouse_config_enabled =
                         state.focus_follows_mouse_config_enabled;
                     let prev_stack_line_enabled = state.stack_line_enabled;
+                    let prev_stack_line_hover_mode = state.stack_line_hover_mode;
                     state.mouse_hides_on_focus = mouse_hides_on_focus;
                     state.focus_follows_mouse_config_enabled = focus_follows_mouse_config_enabled;
                     state.stack_line_enabled = stack_line_enabled;
+                    state.stack_line_hover_mode = stack_line_hover_mode;
                     state.default_layout_mode = default_layout_mode;
                     let prev_active = state.disable_hotkey_active;
                     state.disable_hotkey_active = self
@@ -422,6 +452,7 @@ impl EventTap {
                     if prev_focus_follows_mouse_config_enabled
                         != state.focus_follows_mouse_config_enabled
                         || prev_stack_line_enabled != state.stack_line_enabled
+                        || prev_stack_line_hover_mode != state.stack_line_hover_mode
                     {
                         state.reset_mouse_sampling();
                         self.reset_mouse_move_sample_gate();
@@ -460,7 +491,7 @@ impl EventTap {
         drop(state);
 
         if should_rebuild_mask {
-            self.rebuild_event_tap_mask_if_needed();
+            self.rebuild_event_tap_mask_if_needed(recovery_tx);
         }
     }
 
@@ -488,22 +519,11 @@ impl EventTap {
     #[inline]
     fn reset_mouse_window(&self) { self.mouse_window.set(MouseWindow::default()); }
 
-    fn reconcile_after_tap_reenabled(&self, event: &CGEvent) {
-        let tap_ref = self.tap.borrow();
-        let Some(tap) = tap_ref.as_ref() else {
-            return;
-        };
-        let was_reenabled = tap.take_reenabled_flag();
-        drop(tap_ref);
-        if !was_reenabled {
-            return;
-        }
-
+    fn reconcile_after_tap_reenabled(&self) {
         let mut state = self.state.borrow_mut();
-        debug!("Event tap was re-enabled; clearing pressed_keys to prevent phantom modifiers");
-        state.pressed_keys.clear();
-        state.current_flags = CGEvent::flags(Some(event));
-        state.reconcile_modifier_keys();
+        let flags = CGEventSource::flags_state(CGEventSourceStateID::HIDSystemState);
+        debug!(?flags, "Event tap was re-enabled; reconciling pressed keys");
+        state.reconcile_after_event_tap_reenabled(flags);
         drop(state);
         self.refresh_disable_hotkey_state(&mut self.state.borrow_mut());
     }
@@ -512,8 +532,6 @@ impl EventTap {
         if event_type == CGEventType::MouseMoved {
             return self.on_mouse_moved(event);
         }
-
-        self.reconcile_after_tap_reenabled(event);
 
         let mut state = self.state.borrow_mut();
 
@@ -597,11 +615,6 @@ impl EventTap {
     /// keyboard and flags-changed events already maintain modifier state, and
     /// the sampled move path below is sufficient as a recovery check.
     fn on_mouse_moved(&self, event: &CGEvent) -> bool {
-        // A tap timeout is only relevant to the work we are about to do. This
-        // avoids borrowing the tap and reconciling modifiers for every raw
-        // mouse event while preserving recovery within one sample interval.
-        self.reconcile_after_tap_reenabled(event);
-
         let mut state = self.state.borrow_mut();
         if !state.event_processing_enabled {
             return true;
@@ -625,8 +638,8 @@ impl EventTap {
             }
         }
 
-        // Stack-line hover feedback only changes the cursor when the hit-test
-        // result changes. Avoid queueing a message for every sampled point.
+        // Click mode only needs hit-test transitions for cursor feedback.
+        // Hover mode forwards samples so the actor can detect segment changes.
         if state.stack_line_enabled {
             let hits = self
                 .stack_line_hit_rects
@@ -635,7 +648,9 @@ impl EventTap {
                 .copied()
                 .any(|frame| point_hits_indicator_frame(loc, frame))
                 && !window_server::is_point_occluded_by_external_window(loc);
-            if state.last_stack_line_hit != Some(hits) {
+            if state.stack_line_hover_mode == StackLineHoverMode::Click
+                || state.last_stack_line_hit != Some(hits)
+            {
                 state.last_stack_line_hit = Some(hits);
                 let _ = self.stack_line_tx.try_send(stack_line::Event::MouseMoved {
                     point: loc,
@@ -830,6 +845,26 @@ unsafe extern "C-unwind" fn mouse_callback(
     }
 }
 
+unsafe extern "C-unwind" fn event_tap_reenabled(user_info: *mut std::ffi::c_void) {
+    if user_info.is_null() {
+        return;
+    }
+    let ctx = unsafe { &*(user_info as *const CallbackCtx) };
+    if std::panic::catch_unwind(AssertUnwindSafe(|| ctx.this.reconcile_after_tap_reenabled()))
+        .is_err()
+    {
+        error!("Panic while reconciling input state after event tap recovery");
+    }
+}
+
+unsafe extern "C-unwind" fn event_tap_invalidated(user_info: *mut std::ffi::c_void) {
+    if user_info.is_null() {
+        return;
+    }
+    let ctx = unsafe { &*(user_info as *const CallbackCtx) };
+    let _ = ctx.recovery_tx.send(Recovery::TapInvalidated(ctx.tap_generation));
+}
+
 impl State {
     fn hide_mouse(&mut self) {
         if let Err(e) = event::hide_mouse() {
@@ -881,6 +916,13 @@ impl State {
                 true // non-modifier keys are not reconciled here
             }
         });
+    }
+
+    fn reconcile_after_event_tap_reenabled(&mut self, flags: CGEventFlags) {
+        // Any key-up may have occurred while the tap was disabled. Discard the
+        // edge-triggered cache and use the authoritative live modifier state.
+        self.pressed_keys.clear();
+        self.current_flags = flags;
     }
 
     fn compute_disable_hotkey_active(&self, target: &Hotkey) -> bool {
@@ -1012,5 +1054,18 @@ mod tests {
             state.layout_mode_at_point(CGPoint::new(150.0, 50.0)),
             Some(crate::common::config::LayoutMode::Scrolling)
         );
+    }
+
+    #[test]
+    fn tap_recovery_discards_cached_keys_and_uses_live_flags() {
+        let mut state = State::default();
+        state.pressed_keys.insert(KeyCode::ShiftLeft);
+        state.pressed_keys.insert(KeyCode::KeyA);
+
+        let live_flags = CGEventFlags::MaskShift | CGEventFlags::MaskCommand;
+        state.reconcile_after_event_tap_reenabled(live_flags);
+
+        assert!(state.pressed_keys.is_empty());
+        assert_eq!(state.current_flags, live_flags);
     }
 }

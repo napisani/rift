@@ -141,11 +141,7 @@ impl WmController {
         window_tx_store: Option<WindowTxStore>,
     ) -> (Self, actor::Sender<WmEvent>) {
         let (sender, receiver) = actor::channel();
-        sys::app::set_activation_policy_callback({
-            let sender = sender.clone();
-            move |pid, info| sender.send(WmEvent::AppLaunch(pid, info))
-        });
-        sys::app::set_finished_launching_callback({
+        sys::app::set_application_callback({
             let sender = sender.clone();
             move |pid, info| sender.send(WmEvent::AppLaunch(pid, info))
         });
@@ -249,9 +245,7 @@ impl WmController {
                 self.events_tx.send(Event::ApplicationGloballyDeactivated(pid));
             }
             AppTerminated(pid) => {
-                sys::app::remove_activation_policy_observer(pid);
-                sys::app::remove_finished_launching_observer(pid);
-                sys::app::clear_ready_callback_notified(pid);
+                sys::app::remove_application_observer(pid);
                 self.events_tx.send(Event::ApplicationTerminated(pid));
             }
             ConfigUpdated(new_cfg) => {
@@ -335,31 +329,14 @@ impl WmController {
                     );
                 }
             }
-            Command(Wm(MoveWindowToWorkspace(ws_sel))) => {
-                let maybe_index: Option<usize> = match &ws_sel {
-                    WorkspaceSelector::Index(i) => Some(*i),
-                    WorkspaceSelector::Name(name) => self
-                        .config
-                        .config
-                        .virtual_workspaces
-                        .workspace_names
-                        .iter()
-                        .position(|n| n == name),
-                };
-
-                if let Some(workspace_index) = maybe_index {
-                    self.events_tx.send(reactor::Event::Command(reactor::Command::Layout(
-                        layout::LayoutCommand::MoveWindowToWorkspace {
-                            workspace: workspace_index,
-                            window_id: None,
-                        },
-                    )));
-                } else {
-                    tracing::warn!(
-                        "Hotkey requested move window to workspace {:?} but it could not be resolved; ignoring",
-                        ws_sel
-                    );
-                }
+            Command(Wm(MoveWindowToWorkspace(workspace))) => {
+                self.events_tx.send(reactor::Event::Command(reactor::Command::Layout(
+                    layout::LayoutCommand::MoveWindowToWorkspace {
+                        workspace,
+                        follow: false,
+                        window_id: None,
+                    },
+                )));
             }
             Command(Wm(CreateWorkspace)) => {
                 self.events_tx.send(reactor::Event::Command(reactor::Command::Layout(

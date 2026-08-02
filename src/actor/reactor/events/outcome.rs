@@ -89,6 +89,9 @@ pub(crate) struct ArrangeRequest {
 }
 
 impl EventOutcome {
+    /// The event was observed, but it does not require any follow-up work.
+    pub(crate) fn no_change() -> Self { Self::default() }
+
     /// Combines follow-up work produced by nested reducers while preserving
     /// reducer order for every queued operation.
     pub(crate) fn absorb(&mut self, mut other: Self) {
@@ -134,12 +137,8 @@ impl EventOutcome {
         self.refresh_layout_mode |= other.refresh_layout_mode;
     }
 
-    pub(crate) fn finalized_event(
-        focused_window: Option<WindowId>,
-        is_resize: bool,
-        window_was_destroyed: bool,
-        refresh_window_notifications: bool,
-    ) -> Self {
+    /// The event changed geometry or layout state and requires one arrange pass.
+    pub(crate) fn layout_changed(is_resize: bool) -> Self {
         Self {
             window_server_updates: Vec::new(),
             discoveries: Vec::new(),
@@ -173,12 +172,35 @@ impl EventOutcome {
                 requested: true,
                 passes: 1,
                 is_resize,
-                window_was_destroyed,
+                window_was_destroyed: false,
             },
-            focused_window,
-            refresh_window_notifications,
+            focused_window: None,
+            refresh_window_notifications: false,
             refresh_focus_follows_mouse: false,
             refresh_layout_mode: true,
+        }
+    }
+
+    /// A window entered, left, or changed its membership in the managed set.
+    pub(crate) fn window_membership_changed(
+        window_was_destroyed: bool,
+        refresh_window_notifications: bool,
+    ) -> Self {
+        let mut outcome = Self::layout_changed(false);
+        outcome.arrange.window_was_destroyed = window_was_destroyed;
+        outcome.refresh_window_notifications = refresh_window_notifications;
+        outcome
+    }
+
+    /// Focus changed without changing window membership.
+    pub(crate) fn focus_changed(
+        focused_window: Option<WindowId>,
+        refresh_window_notifications: bool,
+    ) -> Self {
+        Self {
+            focused_window,
+            refresh_window_notifications,
+            ..Self::default()
         }
     }
 
@@ -382,14 +404,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn finalized_events_explicitly_request_all_legacy_follow_up_work() {
-        let outcome = EventOutcome::finalized_event(None, true, false, true);
+    fn default_and_no_change_request_no_follow_up_work() {
+        for outcome in [EventOutcome::default(), EventOutcome::no_change()] {
+            assert!(!outcome.arrange.requested);
+            assert_eq!(outcome.arrange.passes, 0);
+            assert!(!outcome.refresh_window_notifications);
+            assert!(!outcome.refresh_layout_mode);
+        }
+    }
+
+    #[test]
+    fn explicit_change_constructors_request_their_follow_up_work() {
+        let outcome = EventOutcome::layout_changed(true);
 
         assert!(outcome.arrange.requested);
         assert!(outcome.arrange.is_resize);
         assert!(!outcome.arrange.window_was_destroyed);
-        assert!(outcome.refresh_window_notifications);
+        assert!(!outcome.refresh_window_notifications);
         assert!(!outcome.refresh_focus_follows_mouse);
         assert!(outcome.refresh_layout_mode);
+
+        let outcome = EventOutcome::window_membership_changed(true, true);
+        assert!(outcome.arrange.requested);
+        assert!(outcome.arrange.window_was_destroyed);
+        assert!(outcome.refresh_window_notifications);
+
+        let focused = WindowId::new(42, 7);
+        let outcome = EventOutcome::focus_changed(Some(focused), false);
+        assert!(!outcome.arrange.requested);
+        assert_eq!(outcome.focused_window, Some(focused));
     }
 }
