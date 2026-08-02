@@ -324,17 +324,6 @@ enum LayoutCommands {
 }
 
 #[derive(Subcommand)]
-enum SpaceCommands {
-    /// Toggle whether rift manages the current macOS space
-    ToggleActivated,
-    /// Switch to an adjacent macOS space (Mission Control spaces, not virtual workspaces)
-    Switch {
-        /// Direction to switch (left, right, up, down)
-        direction: String,
-    },
-}
-
-#[derive(Subcommand)]
 enum ConfigCommands {
     /// Update animation settings
     SetAnimate {
@@ -1008,17 +997,6 @@ fn map_mission_control_command(cmd: MissionControlCommands) -> Result<RiftComman
             reactor::ReactorCommand::DismissMissionControl,
         ))),
     }
-}
-
-fn map_space_command(cmd: SpaceCommands) -> Result<RiftCommand, String> {
-    let command = match cmd {
-        SpaceCommands::ToggleActivated => reactor::ReactorCommand::ToggleSpaceActivated,
-        SpaceCommands::Switch { direction } => {
-            reactor::ReactorCommand::SwitchSpace(parse_focus_direction(&direction)?)
-        }
-    };
-
-    Ok(RiftCommand::Reactor(reactor::Command::Reactor(command)))
 }
 
 fn map_display_command(cmd: DisplayCommands) -> Result<RiftCommand, String> {
