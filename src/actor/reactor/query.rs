@@ -1,14 +1,13 @@
 use std::sync::mpsc::{RecvError, SyncSender, sync_channel};
 
 use objc2_core_foundation::CGRect;
+use rift_protocol::{ApplicationData, LayoutStateData, WorkspaceLayoutData};
 
 use crate::actor::app::WindowId;
 use crate::actor::menu_bar;
 use crate::actor::reactor::{Event, Reactor, Sender};
 use crate::common::collections::HashSet;
-use crate::model::server::{
-    ApplicationData, DisplayData, LayoutStateData, WindowData, WorkspaceData, WorkspaceLayoutData,
-};
+use crate::model::server::{RuntimeDisplayData, RuntimeWindowData, RuntimeWorkspaceData};
 use crate::model::virtual_workspace::VirtualWorkspaceId;
 use crate::sys::screen::{ScreenInfo, SpaceId};
 
@@ -31,12 +30,12 @@ impl ReactorQueryHandle {
         rx.recv().map_err(|_| RecvError)
     }
 
-    pub fn query_workspaces(&self, space_id: Option<SpaceId>) -> Vec<WorkspaceData> {
+    pub fn query_workspaces(&self, space_id: Option<SpaceId>) -> Vec<RuntimeWorkspaceData> {
         self.send_query(|resp| QueryRequest::Workspaces { space_id, resp })
             .unwrap_or_default()
     }
 
-    pub fn query_windows(&self, space_id: Option<SpaceId>) -> Vec<WindowData> {
+    pub fn query_windows(&self, space_id: Option<SpaceId>) -> Vec<RuntimeWindowData> {
         self.send_query(|resp| QueryRequest::Windows { space_id, resp })
             .unwrap_or_default()
     }
@@ -47,7 +46,7 @@ impl ReactorQueryHandle {
             .flatten()
     }
 
-    pub fn query_displays(&self) -> Vec<DisplayData> {
+    pub fn query_displays(&self) -> Vec<RuntimeDisplayData> {
         self.send_query(QueryRequest::Displays).unwrap_or_default()
     }
 
@@ -60,7 +59,7 @@ impl ReactorQueryHandle {
             .unwrap_or_default()
     }
 
-    pub fn query_window_info(&self, window_id: WindowId) -> Option<WindowData> {
+    pub fn query_window_info(&self, window_id: WindowId) -> Option<RuntimeWindowData> {
         self.send_query(|resp| QueryRequest::WindowInfo { window_id, resp })
             .ok()
             .flatten()
@@ -70,8 +69,12 @@ impl ReactorQueryHandle {
         self.send_query(QueryRequest::Applications).unwrap_or_default()
     }
 
-    pub fn query_layout_state(&self, space_id: u64) -> Option<LayoutStateData> {
-        self.send_query(|resp| QueryRequest::LayoutState { space_id, resp })
+    pub fn query_layout_state(
+        &self,
+        space_id: Option<u64>,
+        workspace_id: Option<usize>,
+    ) -> Option<LayoutStateData> {
+        self.send_query(|resp| QueryRequest::LayoutState { space_id, workspace_id, resp })
             .ok()
             .flatten()
     }
@@ -85,17 +88,17 @@ impl ReactorQueryHandle {
 pub enum QueryRequest {
     Workspaces {
         space_id: Option<SpaceId>,
-        resp: SyncSender<Vec<WorkspaceData>>,
+        resp: SyncSender<Vec<RuntimeWorkspaceData>>,
     },
     Windows {
         space_id: Option<SpaceId>,
-        resp: SyncSender<Vec<WindowData>>,
+        resp: SyncSender<Vec<RuntimeWindowData>>,
     },
     ActiveWorkspace {
         space_id: Option<SpaceId>,
         resp: SyncSender<Option<VirtualWorkspaceId>>,
     },
-    Displays(SyncSender<Vec<DisplayData>>),
+    Displays(SyncSender<Vec<RuntimeDisplayData>>),
     WorkspaceLayouts {
         space_id: Option<SpaceId>,
         workspace_id: Option<usize>,
@@ -103,11 +106,12 @@ pub enum QueryRequest {
     },
     WindowInfo {
         window_id: WindowId,
-        resp: SyncSender<Option<WindowData>>,
+        resp: SyncSender<Option<RuntimeWindowData>>,
     },
     Applications(SyncSender<Vec<ApplicationData>>),
     LayoutState {
-        space_id: u64,
+        space_id: Option<u64>,
+        workspace_id: Option<usize>,
         resp: SyncSender<Option<LayoutStateData>>,
     },
     Metrics(SyncSender<serde_json::Value>),
@@ -137,8 +141,8 @@ impl Reactor {
             QueryRequest::Applications(resp) => {
                 let _ = resp.send(self.query_applications());
             }
-            QueryRequest::LayoutState { space_id, resp } => {
-                let _ = resp.send(self.query_layout_state(space_id));
+            QueryRequest::LayoutState { space_id, workspace_id, resp } => {
+                let _ = resp.send(self.query_layout_state(space_id, workspace_id));
             }
             QueryRequest::Metrics(resp) => {
                 let _ = resp.send(self.query_metrics());
@@ -155,11 +159,11 @@ impl Reactor {
     #[cfg(test)]
     pub(crate) fn test_default_query_space(&self) -> Option<SpaceId> { self.default_query_space() }
 
-    pub fn query_workspaces(&mut self, space_id: Option<SpaceId>) -> Vec<WorkspaceData> {
+    pub fn query_workspaces(&mut self, space_id: Option<SpaceId>) -> Vec<RuntimeWorkspaceData> {
         self.handle_workspace_query(space_id)
     }
 
-    pub fn query_windows(&self, space_id: Option<SpaceId>) -> Vec<WindowData> {
+    pub fn query_windows(&self, space_id: Option<SpaceId>) -> Vec<RuntimeWindowData> {
         self.handle_windows_query(space_id)
     }
 
@@ -167,7 +171,7 @@ impl Reactor {
         self.handle_active_workspace_query(space_id)
     }
 
-    pub fn query_displays(&self) -> Vec<DisplayData> { self.handle_displays_query() }
+    pub fn query_displays(&self) -> Vec<RuntimeDisplayData> { self.handle_displays_query() }
 
     pub fn query_workspace_layouts(
         &mut self,
@@ -177,14 +181,18 @@ impl Reactor {
         self.handle_workspace_layouts_query(space_id, workspace_id)
     }
 
-    pub fn query_window_info(&self, window_id: WindowId) -> Option<WindowData> {
+    pub fn query_window_info(&self, window_id: WindowId) -> Option<RuntimeWindowData> {
         self.handle_window_info_query(window_id)
     }
 
     pub fn query_applications(&self) -> Vec<ApplicationData> { self.handle_applications_query() }
 
-    pub fn query_layout_state(&self, space_id: u64) -> Option<LayoutStateData> {
-        self.handle_layout_state_query(space_id)
+    pub fn query_layout_state(
+        &self,
+        space_id: Option<u64>,
+        workspace_id: Option<usize>,
+    ) -> Option<LayoutStateData> {
+        self.handle_layout_state_query(space_id, workspace_id)
     }
 
     pub fn query_metrics(&self) -> serde_json::Value { self.handle_metrics_query() }
@@ -240,7 +248,10 @@ impl Reactor {
         self.resolve_menu_bar_space_with_preferred(preferred_space)
     }
 
-    fn handle_workspace_query(&mut self, space_id_param: Option<SpaceId>) -> Vec<WorkspaceData> {
+    fn handle_workspace_query(
+        &mut self,
+        space_id_param: Option<SpaceId>,
+    ) -> Vec<RuntimeWorkspaceData> {
         let mut workspaces = Vec::new();
 
         let space_id = space_id_param.or_else(|| self.default_query_space());
@@ -309,7 +320,7 @@ impl Reactor {
             let predicted_map: std::collections::HashMap<WindowId, CGRect> =
                 predicted_positions.into_iter().collect();
 
-            let mut windows: Vec<WindowData> = Vec::new();
+            let mut windows: Vec<RuntimeWindowData> = Vec::new();
             for wid in workspace_windows_ids.into_iter() {
                 if let Some(mut wd) = self.create_window_data(wid) {
                     if !is_active {
@@ -331,7 +342,7 @@ impl Reactor {
                 })
                 .unwrap_or_else(|| "unknown".to_string());
 
-            workspaces.push(WorkspaceData {
+            workspaces.push(RuntimeWorkspaceData {
                 id: format!("{:?}", workspace_id),
                 name: workspace_name.to_string(),
                 layout_mode,
@@ -392,7 +403,7 @@ impl Reactor {
         self.layout_manager.layout_engine.active_workspace(space_id)
     }
 
-    fn handle_displays_query(&self) -> Vec<DisplayData> {
+    fn handle_displays_query(&self) -> Vec<RuntimeDisplayData> {
         let active_context_space = self.active_display_space();
         let active_space_ids = self.active_space_ids();
         let active_space_set: HashSet<u64> = active_space_ids.iter().copied().collect();
@@ -417,7 +428,7 @@ impl Reactor {
                     .filter(|space| !active_space_set.contains(&space.get()))
                     .map(|space| space.get())
                     .collect();
-                DisplayData {
+                RuntimeDisplayData {
                     info: ScreenInfo {
                         space: space_for_screen,
                         ..screen.clone()
@@ -436,7 +447,7 @@ impl Reactor {
             .collect()
     }
 
-    fn handle_windows_query(&self, space_id: Option<SpaceId>) -> Vec<WindowData> {
+    fn handle_windows_query(&self, space_id: Option<SpaceId>) -> Vec<RuntimeWindowData> {
         let target_space = space_id.or_else(|| self.default_query_space());
 
         if let Some(space) = target_space {
@@ -459,7 +470,7 @@ impl Reactor {
         }
     }
 
-    fn handle_window_info_query(&self, window_id: WindowId) -> Option<WindowData> {
+    fn handle_window_info_query(&self, window_id: WindowId) -> Option<RuntimeWindowData> {
         self.create_window_data(window_id)
     }
 
@@ -487,41 +498,52 @@ impl Reactor {
             .collect()
     }
 
-    fn handle_layout_state_query(&self, space_id_u64: u64) -> Option<LayoutStateData> {
-        if space_id_u64 == 0 {
-            return None;
-        }
-        let space_id = SpaceId::new(space_id_u64);
+    fn handle_layout_state_query(
+        &self,
+        space_id_u64: Option<u64>,
+        workspace_id: Option<usize>,
+    ) -> Option<LayoutStateData> {
+        let space_id = match space_id_u64 {
+            Some(space_id) => SpaceId::new(space_id),
+            None => self.default_query_space()?,
+        };
         if !self.space_state.iter_known_spaces().any(|space| space == space_id) {
             return None;
         }
 
-        let _active_workspace = self.layout_manager.layout_engine.active_workspace(space_id)?;
-
-        let active_windows = self
+        let snapshot = self
             .layout_manager
             .layout_engine
-            .windows_in_active_workspace(&self.state.windows, space_id);
-        let floating_windows: Vec<WindowId> = active_windows
+            .query_workspace_layout(space_id, workspace_id)?;
+        let workspace_windows = self
+            .layout_manager
+            .layout_engine
+            .virtual_workspace_manager()
+            .workspace_windows(&self.state.windows, space_id, snapshot.workspace_id);
+        let floating_windows: Vec<WindowId> = workspace_windows
             .iter()
             .filter(|&&wid| self.layout_manager.layout_engine.is_window_floating(wid))
             .copied()
             .collect();
 
-        let tiled_windows: Vec<WindowId> = active_windows
+        let tiled_windows: Vec<WindowId> = workspace_windows
             .iter()
             .filter(|&&wid| !self.layout_manager.layout_engine.is_window_floating(wid))
             .copied()
             .collect();
 
-        let focused_window = self.main_window();
+        let focused_window = self.main_window().filter(|wid| workspace_windows.contains(wid));
 
         Some(LayoutStateData {
-            space_id: space_id_u64,
-            mode: self.layout_manager.layout_engine.layout_mode_at(space_id).to_string(),
-            floating_windows,
-            tiled_windows,
-            focused_window,
+            space_id: space_id.get(),
+            workspace_id: snapshot.workspace_index,
+            is_active_workspace: snapshot.is_active,
+            mode: snapshot.mode.to_string(),
+            floating_windows: floating_windows.into_iter().map(Into::into).collect(),
+            tiled_windows: tiled_windows.into_iter().map(Into::into).collect(),
+            focused_window: focused_window.map(Into::into),
+            selected_window: snapshot.selected_window.map(Into::into),
+            container_tree: snapshot.container_tree,
         })
     }
 

@@ -234,8 +234,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         loop {
             match rx.blocking_recv() {
                 Some((_span, event)) => {
-                    let state = server_state.read();
-                    state.publish(event);
+                    server_state.publish(event);
                 }
                 None => {
                     break;
@@ -323,7 +322,8 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         stack_line_hit_rects,
     );
 
-    let mission_control = MissionControlActor::new(config.clone(), mc_rx, reactor.clone(), mtm);
+    let mission_control =
+        MissionControlActor::new(config.clone(), mc_rx, mc_tx.clone(), reactor.clone(), mtm);
     let mission_control_native = NativeMissionControl::new(events_tx.clone(), mc_native_rx);
 
     if config.settings.default_disable {
