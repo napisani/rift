@@ -1,13 +1,13 @@
 use objc2_core_foundation::CGRect;
+pub use rift_protocol::{DisplaySelector, ReactorCommand};
 use serde::{Deserialize, Serialize};
 
 use crate::actor::app::{AppInfo, AppThreadHandle, WindowId, pid_t};
 use crate::common::log::MetricsCommand;
-use crate::layout_engine::{Direction, LayoutCommand, RestoreScope, RestoreSource};
+use crate::layout_engine::{LayoutCommand, WindowLayoutInfo};
 use crate::model::WindowStore;
 use crate::sys::app::WindowInfo;
 use crate::sys::screen::SpaceId;
-use crate::sys::window_server::WindowServerId;
 
 /// All mutable domain state is owned by the reactor thread.
 ///
@@ -29,49 +29,6 @@ pub enum Command {
     Layout(LayoutCommand),
     Metrics(MetricsCommand),
     Reactor(ReactorCommand),
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(untagged)]
-pub enum DisplaySelector {
-    Direction(Direction),
-    Index(usize),
-    Uuid(String),
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ReactorCommand {
-    Debug,
-    Serialize,
-    SaveLayout {
-        path: std::path::PathBuf,
-    },
-    SaveAndExit,
-    RestoreLayout {
-        path: std::path::PathBuf,
-        scope: RestoreScope,
-        #[serde(default)]
-        source: RestoreSource,
-    },
-    SwitchSpace(Direction),
-    ToggleSpaceActivated,
-    FocusWindow {
-        window_id: WindowId,
-        window_server_id: Option<WindowServerId>,
-    },
-    ShowMissionControlAll,
-    ShowMissionControlCurrent,
-    DismissMissionControl,
-    MoveMouseToDisplay(DisplaySelector),
-    FocusDisplay(DisplaySelector),
-    CloseWindow {
-        window_server_id: Option<WindowServerId>,
-    },
-    MoveWindowToDisplay {
-        selector: DisplaySelector,
-        window_id: Option<u32>,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -139,7 +96,7 @@ pub(crate) struct AppState {
     pub(crate) handle: AppThreadHandle,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct WindowState {
     pub(crate) info: WindowInfo,
     /// The last known frame of the window. Always includes the last write.
@@ -147,8 +104,10 @@ pub(crate) struct WindowState {
     /// This value only updates monotonically with respect to writes; in other
     /// words, we only accept reads when we know they come after the last write.
     pub(crate) frame_monotonic: CGRect,
+    /// Rift/macOS heuristic result, kept separately from an explicit app-rule
+    /// override so every discovered window can remain tracked.
     pub(crate) is_manageable: bool,
-    pub(crate) ignore_app_rule: bool,
+    pub(crate) manage_override: Option<bool>,
 }
 
 impl From<WindowInfo> for WindowState {
@@ -157,28 +116,35 @@ impl From<WindowInfo> for WindowState {
             frame_monotonic: info.frame,
             info,
             is_manageable: false,
-            ignore_app_rule: false,
+            manage_override: None,
         }
     }
 }
 
 impl WindowState {
-    pub(crate) fn is_effectively_manageable(&self) -> bool {
-        self.is_manageable && !self.ignore_app_rule
+    pub(crate) fn layout_info(&self, wid: WindowId) -> WindowLayoutInfo {
+        (
+            wid,
+            Some(self.info.title.clone()),
+            self.info.ax_role.clone(),
+            self.info.ax_subrole.clone(),
+            self.info.is_resizable,
+            self.frame_monotonic.size,
+            self.info.min_size,
+            self.info.max_size,
+        )
     }
 
-    pub(crate) fn matches_filter(&self, filter: WindowFilter) -> bool {
-        match filter {
-            WindowFilter::Manageable => self.is_manageable,
-            WindowFilter::EffectivelyManageable => self.is_effectively_manageable(),
-        }
+    /// The single admission policy used by every layout-facing caller.
+    pub(crate) fn is_admitted(&self) -> bool {
+        self.is_admitted_with_override(self.manage_override)
     }
-}
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum WindowFilter {
-    Manageable,
-    EffectivelyManageable,
+    pub(crate) fn is_admitted_with_override(&self, manage_override: Option<bool>) -> bool {
+        !self.info.is_minimized && manage_override.unwrap_or(self.is_manageable)
+    }
+
+    pub(crate) fn can_reconcile_admission(&self) -> bool { !self.info.is_minimized }
 }
 
 use thiserror::Error;
@@ -199,6 +165,8 @@ pub enum ReactorError {
 
 #[cfg(test)]
 mod tests {
+    use rift_protocol::{RestoreScope, RestoreSource};
+
     use super::*;
 
     #[test]

@@ -1,11 +1,11 @@
 use objc2_core_foundation::CGRect;
 use tracing::{debug, trace};
 
-use crate::actor::app::{Request, WindowId};
+use crate::actor::app::WindowId;
 use crate::actor::reactor::events::EventOutcome;
 use crate::actor::reactor::managers::DragManager;
 use crate::actor::reactor::transaction_manager::TransactionManager;
-use crate::actor::reactor::{DragState, Quiet, Requested, TransactionId, WindowState, utils};
+use crate::actor::reactor::{DragState, Quiet, TransactionId, WindowState, utils};
 use crate::layout_engine::LayoutEvent;
 use crate::model::WindowVisibility;
 use crate::sys::app::WindowInfo as Window;
@@ -40,15 +40,7 @@ pub fn handle_window_created(
         state.windows.track_window_server_info(info);
     }
 
-    let mut window_state: WindowState = window.into();
-    let is_manageable = utils::compute_window_manageability(
-        window_state.info.sys_id,
-        window_state.info.is_minimized,
-        window_state.info.is_standard,
-        window_state.info.is_root,
-        |wsid| state.windows.get_window_server_info(wsid),
-    );
-    window_state.is_manageable = is_manageable;
+    let window_state: WindowState = window.into();
     if let Some(wsid) = window_state.info.sys_id {
         transactions.store_txid(
             wsid,
@@ -58,68 +50,21 @@ pub fn handle_window_created(
     }
 
     state.windows.insert_window(wid, window_state);
+    let _ = utils::refresh_heuristic(state, wid);
 
     let outcome = EventOutcome::window_membership_changed(false, true);
-    Ok(if is_manageable {
-        outcome.with_created_window_finalization(wid)
-    } else {
-        outcome
-    })
+    Ok(
+        if state.windows.window(wid).is_some_and(WindowState::can_reconcile_admission) {
+            outcome.with_created_window_finalization(wid)
+        } else {
+            outcome
+        },
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct WindowDestroyedPayload {
     pub window: WindowId,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct WindowInvalidatedPayload {
-    pub window: WindowId,
-}
-
-pub fn handle_window_invalidated(
-    state: &mut crate::model::RiftState,
-    transactions: &TransactionManager,
-    drag: &mut DragManager,
-    payload: WindowInvalidatedPayload,
-) -> anyhow::Result<EventOutcome> {
-    let wid = payload.window;
-    let window_server_id = state.windows.record(wid).and_then(|record| record.window_server_id());
-    let Some(window_server_id) = window_server_id else {
-        return handle_window_destroyed(state, transactions, drag, WindowDestroyedPayload {
-            window: wid,
-        });
-    };
-
-    // AX identity and native-window identity have different lifetimes. Detach the dead AX
-    // state so it cannot remain in layouts or queries as a ghost, but retain its assignment
-    // off-index until the same WindowServer identity is rediscovered. A later AX loss with no
-    // native peer, or an authoritative WindowServer disappearance, takes the permanent-removal
-    // path below.
-    transactions.remove_for_window(window_server_id);
-    state.windows.detach_window_state(wid);
-    debug!(
-        ?wid,
-        ?window_server_id,
-        "Detached invalid AX identity for later reacquisition"
-    );
-
-    if let DragState::PendingSwap { session, target } = &drag.drag_state
-        && (session.window == wid || *target == wid)
-    {
-        drag.drag_state = DragState::Inactive;
-    }
-    if drag.dragged() == Some(wid) || drag.last_target() == Some(wid) {
-        drag.reset();
-        drag.drag_state = DragState::Inactive;
-    }
-    if drag.skip_layout_for_window == Some(wid) {
-        drag.skip_layout_for_window = None;
-    }
-
-    Ok(EventOutcome::window_membership_changed(true, true)
-        .with_layout_event(LayoutEvent::WindowRemovedPreserveFloating(wid))
-        .with_app_request(wid.pid, Request::GetVisibleWindows))
 }
 
 pub fn handle_window_destroyed(
@@ -177,7 +122,6 @@ pub fn handle_window_minimized(
             return Ok(crate::actor::reactor::events::EventOutcome::no_change());
         }
         window.info.is_minimized = true;
-        window.is_manageable = false;
         window.info.sys_id
     } else {
         debug!(?wid, "Received WindowMinimized for unknown window - ignoring");
@@ -187,6 +131,7 @@ pub fn handle_window_minimized(
         state.windows.mark_window_hidden(ws_id);
     }
     state.windows.set_visibility(wid, WindowVisibility::Minimized);
+    let _ = utils::refresh_heuristic(state, wid);
     Ok(
         crate::actor::reactor::events::EventOutcome::window_membership_changed(false, false)
             .with_layout_event(LayoutEvent::WindowRemoved(wid)),
@@ -204,13 +149,12 @@ pub fn handle_window_deminiaturized(
     payload: WindowDeminiaturizedPayload,
 ) -> anyhow::Result<crate::actor::reactor::events::EventOutcome> {
     let WindowDeminiaturizedPayload { window: wid, active_space } = payload;
-    let (server_id, is_ax_standard, is_ax_root) = match state.windows.window_mut(wid) {
+    match state.windows.window_mut(wid) {
         Some(window) => {
             if !window.info.is_minimized {
                 return Ok(crate::actor::reactor::events::EventOutcome::no_change());
             }
             window.info.is_minimized = false;
-            (window.info.sys_id, window.info.is_standard, window.info.is_root)
         }
         None => {
             debug!(
@@ -219,18 +163,14 @@ pub fn handle_window_deminiaturized(
             );
             return Ok(crate::actor::reactor::events::EventOutcome::no_change());
         }
-    };
-    let is_manageable =
-        utils::compute_window_manageability(server_id, false, is_ax_standard, is_ax_root, |wsid| {
-            state.windows.get_window_server_info(wsid)
-        });
-    if let Some(window) = state.windows.window_mut(wid) {
-        window.is_manageable = is_manageable;
     }
+    let _ = utils::refresh_heuristic(state, wid);
     state.windows.set_visibility(wid, WindowVisibility::Visible);
 
     let mut outcome = crate::actor::reactor::events::EventOutcome::no_change();
-    if is_manageable && let Some(space) = active_space {
+    if state.windows.window(wid).is_some_and(WindowState::is_admitted)
+        && let Some(space) = active_space
+    {
         outcome =
             crate::actor::reactor::events::EventOutcome::window_membership_changed(false, false)
                 .with_layout_event(LayoutEvent::WindowAdded(space, wid));
@@ -242,10 +182,7 @@ pub fn handle_window_deminiaturized(
 pub struct WindowFrameChangedPayload {
     pub window: WindowId,
     pub new_frame: CGRect,
-    pub last_seen: Option<TransactionId>,
-    pub requested: Requested,
     pub mouse_state: Option<MouseState>,
-    pub mission_control_active: bool,
     pub old_space: Option<SpaceId>,
     pub new_space: Option<SpaceId>,
     pub old_space_active: bool,
@@ -257,20 +194,96 @@ pub struct WindowFrameChangedPayload {
     pub screens: Vec<(SpaceId, CGRect, Option<String>)>,
 }
 
+pub enum FrameChangeDisposition {
+    Handled,
+    NeedsGeometryAnalysis,
+}
+
+pub fn classify_window_frame_change(
+    state: &mut crate::model::RiftState,
+    transactions: &TransactionManager,
+    drag: &mut DragManager,
+    wid: WindowId,
+    new_frame: CGRect,
+    last_seen: Option<TransactionId>,
+    requested: bool,
+    mouse_state: &mut Option<MouseState>,
+    mission_control_active: bool,
+) -> FrameChangeDisposition {
+    let Some(window) = state.windows.window(wid) else {
+        query_mouse_for_active_drag(drag, mouse_state);
+        return FrameChangeDisposition::Handled;
+    };
+    let server_id = window.info.sys_id;
+
+    if mission_control_active {
+        drag.reset();
+        drag.drag_state = DragState::Inactive;
+        drag.skip_layout_for_window = None;
+        return FrameChangeDisposition::Handled;
+    }
+
+    if let Some(server) = server_id
+        && let Some(target) = transactions.get_target_frame(server)
+        && let Some(seen) = last_seen
+    {
+        if seen != transactions.get_last_sent_txid(server) {
+            query_mouse_for_active_drag(drag, mouse_state);
+            return FrameChangeDisposition::Handled;
+        }
+        if mouse_state.is_none() {
+            *mouse_state = crate::sys::event::get_mouse_state();
+        }
+        if *mouse_state == Some(MouseState::Down) {
+            transactions.clear_target_for_window(server);
+        } else {
+            if new_frame.same_as(target) {
+                transactions.clear_target_for_window(server);
+            }
+            if let Some(window) = state.windows.window_mut(wid) {
+                window.frame_monotonic = new_frame;
+            }
+            return FrameChangeDisposition::Handled;
+        }
+    }
+    if requested {
+        query_mouse_for_active_drag(drag, mouse_state);
+        if let Some(window) = state.windows.window_mut(wid) {
+            window.frame_monotonic = new_frame;
+        }
+        if let Some(server) = server_id {
+            transactions.clear_target_for_window(server);
+        }
+        return FrameChangeDisposition::Handled;
+    }
+
+    if mouse_state.is_none() {
+        *mouse_state = crate::sys::event::get_mouse_state();
+    }
+    FrameChangeDisposition::NeedsGeometryAnalysis
+}
+
+fn query_mouse_for_active_drag(drag: &DragManager, mouse_state: &mut Option<MouseState>) {
+    if mouse_state.is_none()
+        && matches!(
+            drag.drag_state,
+            DragState::Active { .. } | DragState::PendingSwap { .. }
+        )
+    {
+        *mouse_state = crate::sys::event::get_mouse_state();
+    }
+}
+
 pub fn handle_window_frame_changed(
     state: &mut crate::model::RiftState,
     layout: &mut crate::actor::reactor::managers::LayoutManager,
-    transactions: &TransactionManager,
     drag: &mut DragManager,
     payload: WindowFrameChangedPayload,
 ) -> anyhow::Result<EventOutcome> {
     let WindowFrameChangedPayload {
         window: wid,
         new_frame,
-        last_seen,
-        requested,
         mouse_state,
-        mission_control_active,
         old_space,
         new_space,
         old_space_active,
@@ -288,50 +301,6 @@ pub fn handle_window_frame_changed(
     let server_id = window.info.sys_id;
     let old_frame = window.frame_monotonic;
 
-    if mission_control_active {
-        drag.reset();
-        drag.drag_state = DragState::Inactive;
-        drag.skip_layout_for_window = None;
-        return Ok(outcome);
-    }
-
-    let pending_target = server_id
-        .and_then(|server| transactions.get_target_frame(server).map(|frame| (server, frame)));
-    let last_sent = server_id
-        .map(|server| transactions.get_last_sent_txid(server))
-        .unwrap_or_default();
-    let mut has_pending = pending_target.is_some();
-    let mut triggered_by_rift = has_pending && last_seen.is_some_and(|seen| seen == last_sent);
-    if mouse_state == Some(MouseState::Down) && triggered_by_rift {
-        if let Some((server, _)) = pending_target {
-            transactions.clear_target_for_window(server);
-        }
-        has_pending = false;
-        triggered_by_rift = false;
-    }
-    if has_pending && last_seen.is_some_and(|seen| seen != last_sent) {
-        return Ok(outcome);
-    }
-    if triggered_by_rift {
-        if let Some((server, target)) = pending_target {
-            if new_frame.same_as(target) {
-                transactions.clear_target_for_window(server);
-                if let Some(window) = state.windows.window_mut(wid) {
-                    window.frame_monotonic = new_frame;
-                }
-            }
-        }
-        return Ok(outcome);
-    }
-    if requested.0 {
-        if let Some(window) = state.windows.window_mut(wid) {
-            window.frame_monotonic = new_frame;
-        }
-        if let Some(server) = server_id {
-            transactions.clear_target_for_window(server);
-        }
-        return Ok(outcome);
-    }
     if !old_space_active && !new_space_active {
         return Ok(outcome);
     }

@@ -47,7 +47,6 @@ pub(crate) struct TopologyReassignment {
 pub(crate) struct EventOutcome {
     pub(crate) window_server_updates: Vec<WindowServerInfo>,
     pub(crate) discoveries: Vec<WindowDiscoveryRequest>,
-    pub(crate) activate_application: Option<pid_t>,
     pub(crate) recompute_active_spaces: bool,
     pub(crate) repair_spaces_after_mission_control: bool,
     pub(crate) refresh_after_mission_control: bool,
@@ -66,11 +65,12 @@ pub(crate) struct EventOutcome {
     pub(crate) drag_swap_evaluations: Vec<(WindowId, CGRect)>,
     pub(crate) dispatch_mouse_up: bool,
     pub(crate) close_window: Option<Option<WindowServerId>>,
-    pub(crate) service_config_update: Option<(Config, bool)>,
+    pub(crate) service_config_update: Option<Config>,
     pub(crate) stdout_lines: Vec<String>,
     pub(crate) reapply_app_rules: Vec<WindowId>,
     pub(crate) finalize_created_windows: Vec<WindowId>,
     pub(crate) window_title_broadcasts: Vec<WindowTitleBroadcast>,
+    pub(crate) focused_window_broadcast: Option<WindowId>,
     pub(crate) layout_events: Vec<LayoutEvent>,
     pub(crate) layout_responses: Vec<(EventResponse, Option<SpaceId>)>,
     pub(crate) arrange: ArrangeRequest,
@@ -86,6 +86,7 @@ pub(crate) struct ArrangeRequest {
     pub(crate) passes: u8,
     pub(crate) is_resize: bool,
     pub(crate) window_was_destroyed: bool,
+    pub(crate) space_scope: Option<SpaceId>,
 }
 
 impl EventOutcome {
@@ -97,7 +98,6 @@ impl EventOutcome {
     pub(crate) fn absorb(&mut self, mut other: Self) {
         self.window_server_updates.append(&mut other.window_server_updates);
         self.discoveries.append(&mut other.discoveries);
-        self.activate_application = other.activate_application.or(self.activate_application);
         self.recompute_active_spaces |= other.recompute_active_spaces;
         self.repair_spaces_after_mission_control |= other.repair_spaces_after_mission_control;
         self.refresh_after_mission_control |= other.refresh_after_mission_control;
@@ -123,9 +123,19 @@ impl EventOutcome {
         self.reapply_app_rules.append(&mut other.reapply_app_rules);
         self.finalize_created_windows.append(&mut other.finalize_created_windows);
         self.window_title_broadcasts.append(&mut other.window_title_broadcasts);
+        self.focused_window_broadcast =
+            other.focused_window_broadcast.or(self.focused_window_broadcast);
         self.layout_events.append(&mut other.layout_events);
         self.layout_responses.append(&mut other.layout_responses);
         if other.arrange.requested {
+            self.arrange.space_scope = if self.arrange.requested {
+                match (self.arrange.space_scope, other.arrange.space_scope) {
+                    (Some(existing), Some(other)) if existing == other => Some(existing),
+                    _ => None,
+                }
+            } else {
+                other.arrange.space_scope
+            };
             self.arrange.requested = true;
             self.arrange.passes = self.arrange.passes.saturating_add(other.arrange.passes).max(1);
             self.arrange.is_resize |= other.arrange.is_resize;
@@ -142,7 +152,6 @@ impl EventOutcome {
         Self {
             window_server_updates: Vec::new(),
             discoveries: Vec::new(),
-            activate_application: None,
             recompute_active_spaces: false,
             repair_spaces_after_mission_control: false,
             refresh_after_mission_control: false,
@@ -166,6 +175,7 @@ impl EventOutcome {
             reapply_app_rules: Vec::new(),
             finalize_created_windows: Vec::new(),
             window_title_broadcasts: Vec::new(),
+            focused_window_broadcast: None,
             layout_events: Vec::new(),
             layout_responses: Vec::new(),
             arrange: ArrangeRequest {
@@ -173,6 +183,7 @@ impl EventOutcome {
                 passes: 1,
                 is_resize,
                 window_was_destroyed: false,
+                space_scope: None,
             },
             focused_window: None,
             refresh_window_notifications: false,
@@ -230,11 +241,6 @@ impl EventOutcome {
         self
     }
 
-    pub(crate) fn with_application_activation(mut self, pid: pid_t) -> Self {
-        self.activate_application = Some(pid);
-        self
-    }
-
     pub(crate) fn with_active_space_recompute(mut self) -> Self {
         self.recompute_active_spaces = true;
         self
@@ -254,6 +260,11 @@ impl EventOutcome {
     pub(crate) fn with_arrange_passes(mut self, passes: u8) -> Self {
         self.arrange.requested = passes > 0;
         self.arrange.passes = passes;
+        self
+    }
+
+    pub(crate) fn with_arrange_space_scope(mut self, space_scope: Option<SpaceId>) -> Self {
+        self.arrange.space_scope = space_scope;
         self
     }
 
@@ -364,8 +375,8 @@ impl EventOutcome {
         self
     }
 
-    pub(crate) fn with_service_config_update(mut self, config: Config, keys_changed: bool) -> Self {
-        self.service_config_update = Some((config, keys_changed));
+    pub(crate) fn with_service_config_update(mut self, config: Config) -> Self {
+        self.service_config_update = Some(config);
         self
     }
 
@@ -395,6 +406,11 @@ impl EventOutcome {
             previous_title,
             new_title,
         });
+        self
+    }
+
+    pub(crate) fn with_focused_window_broadcast(mut self, window: WindowId) -> Self {
+        self.focused_window_broadcast = Some(window);
         self
     }
 }
@@ -433,5 +449,26 @@ mod tests {
         let outcome = EventOutcome::focus_changed(Some(focused), false);
         assert!(!outcome.arrange.requested);
         assert_eq!(outcome.focused_window, Some(focused));
+
+        let outcome = EventOutcome::no_change().with_focused_window_broadcast(focused);
+        assert_eq!(outcome.focused_window_broadcast, Some(focused));
+    }
+
+    #[test]
+    fn absorbed_arrange_requests_keep_only_a_common_space_scope() {
+        let first_space = SpaceId::new(1);
+        let second_space = SpaceId::new(2);
+        let mut outcome =
+            EventOutcome::layout_changed(false).with_arrange_space_scope(Some(first_space));
+
+        outcome.absorb(
+            EventOutcome::layout_changed(false).with_arrange_space_scope(Some(first_space)),
+        );
+        assert_eq!(outcome.arrange.space_scope, Some(first_space));
+
+        outcome.absorb(
+            EventOutcome::layout_changed(false).with_arrange_space_scope(Some(second_space)),
+        );
+        assert_eq!(outcome.arrange.space_scope, None);
     }
 }
