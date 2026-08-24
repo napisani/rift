@@ -8,6 +8,7 @@ use super::TransactionId;
 use crate::actor::app::{AppThreadHandle, Request, WindowId, pid_t};
 use crate::actor::reactor::Reactor;
 use crate::common::collections::HashMap;
+use crate::common::config::Config;
 use crate::sys::geometry::{Round, SameAs};
 use crate::sys::power;
 use crate::sys::screen::SpaceId;
@@ -148,7 +149,7 @@ impl AnimationManager {
         let Some(active_ws) = reactor.layout_manager.layout_engine.active_workspace(space) else {
             return false;
         };
-        let mut anim = Animation::new();
+        let mut anim = Animation::new(reactor.config.clone());
         let mut animated_count = 0;
         let mut any_frame_changed = false;
 
@@ -273,7 +274,31 @@ impl AnimationManager {
         layout: &[(WindowId, CGRect)],
         skip_wid: Option<WindowId>,
     ) -> bool {
-        let mut per_app: HashMap<pid_t, Vec<(WindowId, CGRect)>> = HashMap::default();
+        Self::instant_layout_inner(reactor, space, layout, skip_wid, false)
+    }
+
+    /// Apply the position-only layout used while switching virtual workspaces.
+    ///
+    /// Keep this entry point separate from `instant_layout`: layouts merely suppressed
+    /// while a switch is in progress may still change window sizes and must use the
+    /// full-frame request.
+    pub fn workspace_switch_layout(
+        reactor: &mut Reactor,
+        space: SpaceId,
+        layout: &[(WindowId, CGRect)],
+        skip_wid: Option<WindowId>,
+    ) -> bool {
+        Self::instant_layout_inner(reactor, space, layout, skip_wid, true)
+    }
+
+    fn instant_layout_inner(
+        reactor: &mut Reactor,
+        space: SpaceId,
+        layout: &[(WindowId, CGRect)],
+        skip_wid: Option<WindowId>,
+        position_only: bool,
+    ) -> bool {
+        let mut per_app: HashMap<pid_t, Vec<(WindowId, CGRect, bool)>> = HashMap::default();
         let mut any_frame_changed = false;
 
         for &(wid, target_frame) in layout {
@@ -316,7 +341,8 @@ impl AnimationManager {
                 "Instant workspace positioning"
             );
 
-            per_app.entry(wid.pid).or_default().push((wid, target_frame));
+            let size_unchanged = current_frame.size.same_as(target_frame.size);
+            per_app.entry(wid.pid).or_default().push((wid, target_frame, size_unchanged));
             window.frame_monotonic = target_frame;
         }
 
@@ -332,7 +358,7 @@ impl AnimationManager {
 
             let handle = app_state.handle.clone();
 
-            let (first_wid, first_target) = frames[0];
+            let (first_wid, first_target, _) = frames[0];
             let mut txid = TransactionId::default();
             let mut has_txid = false;
             let mut txid_entries: Vec<(WindowServerId, TransactionId, CGRect)> = Vec::new();
@@ -345,7 +371,7 @@ impl AnimationManager {
             }
 
             if has_txid {
-                for (wid, frame) in frames.iter().skip(1) {
+                for (wid, frame, _) in frames.iter().skip(1) {
                     if let Some(w) = reactor.state.windows.window_mut(*wid)
                         && let Some(wsid) = w.info.sys_id
                     {
@@ -356,14 +382,41 @@ impl AnimationManager {
                 reactor.transaction_manager.update_txid_entries(txid_entries);
             }
 
-            let frames_to_send = frames.clone();
-            if let Err(e) = handle.send(Request::SetBatchWindowFrame(frames_to_send, txid, true)) {
-                debug!(
-                    ?pid,
-                    ?e,
-                    "Failed to send batch frame request - app may have quit"
-                );
-                continue;
+            let requests = if position_only {
+                let mut positions = Vec::new();
+                let mut full_frames = Vec::new();
+                for (wid, frame, size_unchanged) in frames {
+                    if size_unchanged {
+                        positions.push((wid, frame.origin));
+                    } else {
+                        full_frames.push((wid, frame));
+                    }
+                }
+
+                let mut requests = Vec::with_capacity(2);
+                if !positions.is_empty() {
+                    requests.push(Request::SetWorkspaceSwitchPositions(positions, txid, true));
+                }
+                if !full_frames.is_empty() {
+                    requests.push(Request::SetBatchWindowFrame(full_frames, txid, true));
+                }
+                requests
+            } else {
+                vec![Request::SetBatchWindowFrame(
+                    frames.into_iter().map(|(wid, frame, _)| (wid, frame)).collect(),
+                    txid,
+                    true,
+                )]
+            };
+            for request in requests {
+                if let Err(e) = handle.send(request) {
+                    debug!(
+                        ?pid,
+                        ?e,
+                        "Failed to send instant layout request - app may have quit"
+                    );
+                    break;
+                }
             }
         }
 
@@ -406,13 +459,14 @@ impl ActiveAnimation {
 }
 
 impl Animation {
-    pub fn new() -> Self {
-        const FPS: f64 = 100.0;
-        const DURATION: f64 = 0.30;
-        let interval = Duration::from_secs_f64(1.0 / FPS);
+    pub fn new(config: Config) -> Self {
+        //const FPS: f64 = 100.0;
+        //const DURATION: f64 = 0.30;
+        let interval = Duration::from_secs_f64(1.0 / config.settings.animation_fps);
         Self {
             interval,
-            frames: (DURATION * FPS).round() as u32,
+            frames: (config.settings.animation_duration * config.settings.animation_fps).round()
+                as u32,
             windows: vec![],
             handled_windows: vec![],
         }
@@ -581,8 +635,10 @@ mod tests {
         CGRect::new(CGPoint::new(origin_x, origin_y), CGSize::new(width, height))
     }
 
+    fn config() -> Config { Config::default() }
+
     fn animation(handle: &AppThreadHandle, wid: WindowId, from: CGRect, to: CGRect) -> Animation {
-        let mut animation = Animation::new();
+        let mut animation = Animation::new(config());
         animation.add_window(handle, wid, from, to, false, TransactionId::default());
         animation
     }
@@ -695,7 +751,7 @@ mod tests {
         let wid1 = WindowId::new(1, 1);
         let wid2 = WindowId::new(1, 2);
         let wid3 = WindowId::new(1, 3);
-        let mut first = Animation::new();
+        let mut first = Animation::new(config());
         first.add_window(
             &handle,
             wid1,
@@ -712,7 +768,7 @@ mod tests {
             false,
             TransactionId::default(),
         );
-        let mut second = Animation::new();
+        let mut second = Animation::new(config());
         second.add_window(
             &handle,
             wid1,
@@ -758,7 +814,7 @@ mod tests {
         let handle = AppThreadHandle::new_for_test(tx);
         let wid1 = WindowId::new(1, 1);
         let wid2 = WindowId::new(1, 2);
-        let mut first = Animation::new();
+        let mut first = Animation::new(config());
         first.add_window(
             &handle,
             wid1,
@@ -775,7 +831,7 @@ mod tests {
             false,
             TransactionId::default(),
         );
-        let mut second = Animation::new();
+        let mut second = Animation::new(config());
         second.add_window(
             &handle,
             wid1,
