@@ -45,7 +45,6 @@ pub struct WindowRecord {
     pending_operation: Option<PendingWindowOperation>,
     operation_generation: u64,
     rule_floating: bool,
-    last_rule_decision: bool,
 }
 
 impl WindowRecord {
@@ -63,12 +62,11 @@ impl WindowRecord {
         self.pending_operation.and_then(|operation| operation.requested_frame)
     }
 
-    pub fn is_manageable(&self) -> bool {
-        self.state.as_ref().is_some_and(|state| state.is_manageable)
-    }
-
-    pub fn is_effectively_manageable(&self) -> bool {
-        self.state.as_ref().is_some_and(WindowState::is_effectively_manageable)
+    pub(crate) fn is_admitted_with_rule_override(
+        &self,
+        rule_override: Option<bool>,
+    ) -> Option<bool> {
+        self.state.as_ref().map(|state| state.is_admitted_with_override(rule_override))
     }
 
     pub fn window_server_id(&self) -> Option<WindowServerId> { self.window_server_id }
@@ -252,23 +250,6 @@ impl WindowStore {
         }
     }
 
-    /// Drop an invalid AX-backed state without discarding recoverable identity metadata.
-    ///
-    /// The workspace index contains only live windows, so detached records cannot leak into
-    /// workspace queries or layout projections. `insert_window` restores the index if this AX
-    /// identity is reacquired; a real destruction removes the retained record normally.
-    pub(crate) fn detach_window_state(&mut self, window_id: WindowId) {
-        let workspace = self.windows.get(&window_id).and_then(|record| record.workspace);
-        if let Some(workspace) = workspace {
-            self.remove_window_from_workspace_index(window_id, workspace);
-        }
-        if let Some(record) = self.windows.get_mut(&window_id) {
-            record.state = None;
-            record.pending_operation = None;
-        }
-        self.prune_window_record(window_id);
-    }
-
     pub fn record(&self, window_id: WindowId) -> Option<&WindowRecord> {
         self.windows.get(&window_id)
     }
@@ -326,7 +307,6 @@ impl WindowStore {
                 && record.window_server_id.is_none()
                 && record.workspace.is_none()
                 && !record.rule_floating
-                && !record.last_rule_decision
         });
         if should_remove {
             self.windows.remove(&window_id);
@@ -769,26 +749,18 @@ impl WindowStore {
             return;
         }
 
-        let (
-            workspace,
-            rule_floating,
-            last_rule_decision,
-            placement,
-            visibility,
-            pending,
-            generation,
-        ) = match self.windows.get(&from) {
-            Some(record) => (
-                record.workspace,
-                record.rule_floating,
-                record.last_rule_decision,
-                record.placement,
-                record.visibility,
-                record.pending_operation,
-                record.operation_generation,
-            ),
-            None => return,
-        };
+        let (workspace, rule_floating, placement, visibility, pending, generation) =
+            match self.windows.get(&from) {
+                Some(record) => (
+                    record.workspace,
+                    record.rule_floating,
+                    record.placement,
+                    record.visibility,
+                    record.pending_operation,
+                    record.operation_generation,
+                ),
+                None => return,
+            };
 
         let target_workspace = self.windows.get(&to).and_then(|record| record.workspace);
 
@@ -805,7 +777,6 @@ impl WindowStore {
             target.workspace = workspace;
         }
         target.rule_floating |= rule_floating;
-        target.last_rule_decision |= last_rule_decision;
         target.placement = placement;
         target.visibility = visibility;
         target.pending_operation = pending;
@@ -815,7 +786,6 @@ impl WindowStore {
         if let Some(source) = self.windows.get_mut(&from) {
             source.workspace = None;
             source.rule_floating = false;
-            source.last_rule_decision = false;
             source.pending_operation = None;
         }
 
@@ -838,15 +808,16 @@ impl WindowStore {
         self.prune_window_record(from);
     }
 
-    pub fn set_rule_floating(&mut self, window_id: WindowId, value: bool) {
+    pub fn replace_rule_floating(&mut self, window_id: WindowId, value: bool) -> bool {
         let record = self.windows.entry(window_id).or_default();
-        record.rule_floating = value;
+        let previous = std::mem::replace(&mut record.rule_floating, value);
         record.placement = if value {
             WindowPlacement::Floating
         } else {
             WindowPlacement::Tiled
         };
         self.prune_window_record(window_id);
+        previous
     }
 
     pub fn clear_rule_floating(&mut self, window_id: WindowId) {
@@ -863,19 +834,9 @@ impl WindowStore {
         self.windows.get(&window_id).is_some_and(|record| record.rule_floating)
     }
 
-    pub fn set_last_rule_decision(&mut self, window_id: WindowId, value: bool) {
-        self.windows.entry(window_id).or_default().last_rule_decision = value;
-        self.app_windows.entry(window_id.pid).or_default().insert(window_id);
-    }
-
-    pub fn last_rule_decision(&self, window_id: WindowId) -> bool {
-        self.windows.get(&window_id).is_some_and(|record| record.last_rule_decision)
-    }
-
     pub fn clear_rule_metadata(&mut self, window_id: WindowId) {
         if let Some(record) = self.windows.get_mut(&window_id) {
             record.rule_floating = false;
-            record.last_rule_decision = false;
         }
         self.prune_window_record(window_id);
     }
@@ -1103,20 +1064,6 @@ impl WindowStore {
 mod tests {
     use super::*;
     use crate::model::virtual_workspace::WorkspaceStore;
-
-    #[test]
-    fn detached_unassigned_window_keeps_native_identity_for_recovery() {
-        let mut window_store = WindowStore::default();
-        let wid = WindowId::new(42, 7);
-        let wsid = WindowServerId::new(7);
-
-        window_store.track_window_server_id(wsid, wid);
-        window_store.detach_window_state(wid);
-
-        assert!(window_store.record(wid).is_some());
-        assert_eq!(window_store.tracked_window_id(wsid), Some(wid));
-        window_store.debug_assert_invariants();
-    }
 
     #[test]
     fn authoritative_space_only_record_is_not_pruned() {
