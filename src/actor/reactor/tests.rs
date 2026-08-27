@@ -2450,6 +2450,45 @@ fn auto_workspace_switch_follows_activated_window_when_same_app_is_visible_elsew
 }
 
 #[test]
+fn wake_restored_activation_does_not_switch_workspace_before_user_input() {
+    let (mut apps, mut reactor) = test_context();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+    let activated = WindowId::new(2, 1);
+
+    reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+    apps.make_app_and_settle(&mut reactor, 2, make_windows(2));
+    reactor.send_layout_event(LayoutEvent::WindowFocused(space, activated));
+    reactor.handle_test_layout_command(LayoutCommand::MoveWindowToWorkspace {
+        workspace: WorkspaceSelector::Index(1),
+        follow: false,
+        window_id: None,
+    });
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(0));
+    apps.simulate_until_quiet(&mut reactor);
+
+    reactor.handle_event(Event::SystemWoke);
+    reactor.handle_event(Event::ApplicationGloballyActivated(activated.pid));
+    reactor.handle_event(Event::ApplicationActivated(activated.pid, Quiet::No));
+
+    assert_eq!(
+        reactor.layout_manager.layout_engine.active_workspace_idx(space),
+        Some(0),
+        "loginwindow's restored activation must not change virtual workspaces"
+    );
+
+    // A real input event ends lifecycle suppression, so normal click/Dock
+    // activation semantics continue to work after recovery.
+    reactor.handle_event(Event::MouseUp);
+    reactor.handle_event(Event::ApplicationActivated(activated.pid, Quiet::No));
+    assert_eq!(
+        reactor.layout_manager.layout_engine.active_workspace_idx(space),
+        Some(1),
+        "auto workspace switching should resume after explicit user input"
+    );
+}
+
+#[test]
 fn dock_activation_reveals_window_in_active_scrolling_workspace() {
     let (mut apps, mut reactor) = test_context();
     let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(600., 600.));
@@ -2667,6 +2706,46 @@ fn workspace_query_uses_authoritative_assignment_after_move() {
         Vec::<WindowId>::new()
     );
     assert_eq!(reactor.test_workspace_windows(space, ws2), vec![wid]);
+}
+
+#[test]
+fn workspace_query_exposes_scrolling_order_for_inactive_workspace() {
+    let (mut apps, mut reactor) = test_context();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+    let w1 = WindowId::new(1, 1);
+    let w2 = WindowId::new(1, 2);
+    let w3 = WindowId::new(1, 3);
+
+    apps.make_app_and_settle_on_screen(&mut reactor, screen, space, 1, make_windows(3));
+    reactor.handle_test_layout_command(LayoutCommand::SetWorkspaceLayout {
+        workspace: None,
+        mode: LayoutMode::Scrolling,
+    });
+    apps.simulate_until_quiet(&mut reactor);
+
+    // The latest window is selected. Moving it left changes topology without changing
+    // workspace membership/insertion order.
+    reactor.handle_test_layout_command(LayoutCommand::MoveNode(Direction::Left));
+    apps.simulate_until_quiet(&mut reactor);
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(1));
+    apps.simulate_until_quiet(&mut reactor);
+
+    let queried = reactor.query_workspaces(Some(space));
+    let inactive = &queried[0];
+    assert!(!inactive.is_active);
+    assert_eq!(
+        inactive.windows.iter().map(|window| window.id).collect::<Vec<_>>(),
+        vec![w1, w3, w2]
+    );
+    assert_eq!(
+        inactive
+            .windows
+            .iter()
+            .map(|window| window.layout_position.map(|position| (position.column, position.row)))
+            .collect::<Vec<_>>(),
+        vec![Some((0, 0)), Some((1, 0)), Some((2, 0))]
+    );
 }
 
 #[test]

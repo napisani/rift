@@ -436,6 +436,7 @@ impl Reactor {
                 awaiting_post_session_snapshot: false,
                 pending_visible_refresh: false,
                 deferred_refresh_tracks_mission_control: false,
+                suppress_auto_workspace_switch_until_input: false,
             },
             pending_space_change_manager: managers::PendingSpaceChangeManager {
                 pending_space_change: None,
@@ -1022,6 +1023,14 @@ impl Reactor {
         self.log_event(&event);
         self.recording_manager.record.on_event(&event);
 
+        // Wake/unlock produces synthetic activation notifications as loginwindow
+        // yields focus back to the pre-sleep application. Only real input makes
+        // a subsequent activation a trustworthy request to follow an app to a
+        // different virtual workspace.
+        if matches!(event, Event::MouseUp | Event::MouseMoved(_) | Event::Command(_)) {
+            self.refresh_quarantine_manager.suppress_auto_workspace_switch_until_input = false;
+        }
+
         match event {
             Event::SystemWillSleep => {
                 self.refresh_quarantine_manager.sleeping = true;
@@ -1031,6 +1040,7 @@ impl Reactor {
             Event::SystemWoke => {
                 self.refresh_quarantine_manager.sleeping = true;
                 self.refresh_quarantine_manager.awaiting_post_wake_snapshot = true;
+                self.refresh_quarantine_manager.suppress_auto_workspace_switch_until_input = true;
                 let outcome = system_workflow::handle_system_woke()?;
                 self.defer_visible_refresh(true);
                 return Ok(outcome);
@@ -1043,6 +1053,7 @@ impl Reactor {
             Event::SessionDidBecomeActive => {
                 self.refresh_quarantine_manager.session_inactive = true;
                 self.refresh_quarantine_manager.awaiting_post_session_snapshot = true;
+                self.refresh_quarantine_manager.suppress_auto_workspace_switch_until_input = true;
                 self.defer_visible_refresh(true);
                 return Ok(EventOutcome::default());
             }
@@ -1989,6 +2000,11 @@ impl Reactor {
             // Publish the menu state once after all arrange passes have completed.
             self.maybe_send_menu_update();
         }
+        if outcome.broadcast_layout_changed && layout_changed {
+            self.broadcast_layout_changed(
+                outcome.arrange.space_scope.or_else(|| self.workspace_command_space()),
+            );
+        }
 
         for request in outcome.raise_requests {
             if let Err(error) = self.communication_manager.raise_manager_tx.try_send(request) {
@@ -2133,6 +2149,7 @@ impl Reactor {
             id: window_id,
             is_floating: self.layout_manager.layout_engine.is_window_floating(window_id),
             is_focused: self.main_window() == Some(window_id),
+            layout_position: None,
             app_name,
             info: WindowInfo {
                 title: window_state.info.title.clone(),
@@ -2388,6 +2405,30 @@ impl Reactor {
                 workspace_name,
                 space_id: space.get(),
                 display_uuid,
+            };
+            let _ = self.communication_manager.event_broadcaster.send(event);
+        }
+    }
+
+    fn broadcast_layout_changed(&self, space: Option<SpaceId>) {
+        if let Some(space) = space
+            && self.is_space_active(space)
+            && let Some(workspace_id) = self.layout_manager.layout_engine.active_workspace(space)
+            && let Some(layout) = self.query_layout_state(Some(space.get()), None)
+        {
+            let workspace_index = self.layout_manager.layout_engine.active_workspace_idx(space);
+            let workspace_name = self
+                .layout_manager
+                .layout_engine
+                .workspace_name(space, workspace_id)
+                .unwrap_or_else(|| format!("Workspace {:?}", workspace_id));
+            let event = BroadcastEvent::LayoutChanged {
+                workspace_id: protocol_workspace_id(workspace_id),
+                workspace_index,
+                workspace_name,
+                space_id: space.get(),
+                display_uuid: self.display_uuid_for_space(space),
+                layout,
             };
             let _ = self.communication_manager.event_broadcaster.send(event);
         }
@@ -3596,6 +3637,14 @@ impl Reactor {
     }
 
     fn handle_app_activation_workspace_switch(&mut self, pid: pid_t) -> EventOutcome {
+        if self.refresh_quarantine_manager.suppress_auto_workspace_switch_until_input {
+            debug!(
+                pid,
+                "Skipping auto workspace switch for lifecycle-restored activation before user input"
+            );
+            return EventOutcome::no_change();
+        }
+
         if self.workspace_switch_manager.active_workspace_switch.is_some() {
             trace!(
                 "Skipping auto workspace switch for pid {} because a workspace switch is in progress",
@@ -4122,6 +4171,18 @@ impl Reactor {
             .or_else(|| window_server::get_window(wsid));
 
         let Some(info) = window_info else { return false };
+        // The untracked-window fallback exists for ordinary application
+        // windows that are intentionally outside Rift's model. Desktop,
+        // menu-bar, Dock, and other system surfaces use nonzero layers and
+        // must never be made key merely because the pointer crossed them.
+        if info.layer != 0 {
+            trace!(
+                ?wsid,
+                layer = info.layer,
+                "Skipping non-application surface under cursor"
+            );
+            return false;
+        }
         window_server::make_key_window(info.pid, wsid).is_ok()
     }
 

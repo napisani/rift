@@ -702,27 +702,26 @@ fn map_window_command(cmd: WindowCommands) -> Result<RiftCommand, String> {
             direction,
             window_id,
             window_server_id,
-        } => {
-            if let Some(dir) = direction {
-                return Ok(RiftCommand::Reactor(reactor::Command::Layout(LC::MoveFocus(
-                    dir.into(),
-                ))));
+        } => match (direction, window_id) {
+            (Some(direction), None) => Ok(CliCommand::Reactor(reactor::Command::Layout(
+                LC::MoveFocus(parse_focus_direction(&direction)?),
+            ))),
+            (None, Some(window_id)) => Ok(CliCommand::Reactor(reactor::Command::Reactor(
+                reactor::ReactorCommand::FocusWindow {
+                    window_id: parse_window_id(&window_id)?.into(),
+                    window_server_id: window_server_id
+                        .as_deref()
+                        .map(parse_window_server_id)
+                        .map(|result| result.map(|id| id.as_u32()))
+                        .transpose()?,
+                },
+            ))),
+            (None, None) => Err("window focus requires a direction or --window-id".to_string()),
+            (Some(_), Some(_)) => {
+                Err("window focus accepts either a direction or --window-id, not both".to_string())
             }
-
-            if let Some(wid_str) = window_id {
-                let wid = parse_window_id(&wid_str)?;
-                let wsid = window_server_id.map(WindowServerId::new);
-                return Ok(RiftCommand::Reactor(reactor::Command::Reactor(
-                    reactor::ReactorCommand::FocusWindow {
-                        window_id: wid,
-                        window_server_id: wsid,
-                    },
-                )));
-            }
-
-            Err("Focus command requires either --direction or --window-id".to_string())
-        }
-        WindowCommands::ToggleFloat => Ok(RiftCommand::Reactor(reactor::Command::Layout(
+        },
+        WindowCommands::ToggleFloat => Ok(CliCommand::Reactor(reactor::Command::Layout(
             LC::ToggleWindowFloating,
         ))),
         WindowCommands::ToggleFullscreen => Ok(RiftCommand::Reactor(reactor::Command::Layout(
@@ -764,34 +763,51 @@ fn parse_window_server_id(input: &str) -> Result<WindowServerId, String> {
     Ok(WindowServerId::new(value))
 }
 
-fn parse_window_id(input: &str) -> Result<WindowId, String> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Err("window_id cannot be empty".to_string());
+fn parse_window_id(input: &str) -> Result<InternalWindowId, String> {
+    let input = input.trim();
+    if let Ok(window_id) = serde_json::from_str(input) {
+        return Ok(window_id);
     }
-
-    if let Ok(window_id) = serde_json::from_str(trimmed) {
+    if let Some(window_id) = InternalWindowId::from_debug_string(input) {
         return Ok(window_id);
     }
 
-    if let Some(window_id) = WindowId::from_debug_string(trimmed) {
-        return Ok(window_id);
-    }
+    if let Some((pid, idx)) = input.split_once(':') {
 
-    if let Some((pid, idx)) = trimmed.split_once(':') {
         let json_array = format!("[{},{}]", pid.trim(), idx.trim());
         return serde_json::from_str(&json_array).map_err(|e| {
             format!(
                 "Invalid window_id format '{}'. Expected 'pid:idx' (e.g., '1234:1'). Error: {}",
-                trimmed, e
+                input, e
             )
         });
     }
 
     Err(format!(
         "Invalid window id '{}'; expected 'pid:idx', '[pid,idx]', '{{\"pid\":123,\"idx\":1}}', or `WindowId {{ pid: 123, idx: 1 }}`",
-        trimmed
+        input
     ))
+}
+
+fn protocol_window_id(window_id: &InternalWindowId) -> Result<rift_protocol::WindowId, String> {
+    rift_protocol::WindowId::new(window_id.pid, window_id.idx.get())
+        .ok_or_else(|| "window id index must be non-zero".to_string())
+}
+
+fn parse_event_kind(input: &str) -> Result<EventKind, String> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "workspace_changed" => Ok(EventKind::WorkspaceChanged),
+        "windows_changed" => Ok(EventKind::WindowsChanged),
+        "window_title_changed" => Ok(EventKind::WindowTitleChanged),
+        "focused_window_changed" => Ok(EventKind::FocusedWindowChanged),
+        "stacks_changed" => Ok(EventKind::StacksChanged),
+        "layout_changed" => Ok(EventKind::LayoutChanged),
+        "*" => Ok(EventKind::All),
+        other => Err(format!(
+            "Invalid event '{}'; expected workspace_changed, windows_changed, window_title_changed, focused_window_changed, stacks_changed, layout_changed, or *",
+            other
+        )),
+    }
 }
 
 fn parse_layout_mode(value: &str) -> Result<LayoutMode, String> {
@@ -999,7 +1015,7 @@ fn map_mission_control_command(cmd: MissionControlCommands) -> Result<RiftComman
     }
 }
 
-fn map_display_command(cmd: DisplayCommands) -> Result<RiftCommand, String> {
+fn map_display_command(cmd: DisplayCommands) -> Result<CliCommand, String> {
     match cmd {
         DisplayCommands::Focus { direction, index, uuid } => {
             let selector = build_display_selector(direction, index, uuid)?;
@@ -1028,20 +1044,6 @@ fn map_display_command(cmd: DisplayCommands) -> Result<RiftCommand, String> {
                 window_id,
             },
         ))),
-    }
-}
-
-fn map_space_command(cmd: SpaceCommands) -> Result<RiftCommand, String> {
-    match cmd {
-        SpaceCommands::ToggleActivated => Ok(RiftCommand::Reactor(reactor::Command::Reactor(
-            reactor::ReactorCommand::ToggleSpaceActivated,
-        ))),
-        SpaceCommands::Switch { direction } => {
-            let dir = parse_focus_direction(&direction)?;
-            Ok(RiftCommand::Reactor(reactor::Command::Reactor(
-                reactor::ReactorCommand::SwitchSpace(dir),
-            )))
-        }
     }
 }
 
