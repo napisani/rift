@@ -3,15 +3,12 @@ use std::path::PathBuf;
 use std::process::{self};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use rift_protocol::{EventKind, RiftRequest, RiftResponse};
-use rift_wm::actor::app::WindowId as InternalWindowId;
+use rift_wm::actor::app::WindowId;
 use rift_wm::actor::reactor::{self, DisplaySelector};
 use rift_wm::common::config::{LayoutMode, WorkspaceSelector};
-use rift_wm::ipc::RiftMachClient;
+use rift_wm::ipc::{RiftCommand, RiftMachClient, RiftRequest, RiftResponse};
 use rift_wm::layout_engine as layout;
 use rift_wm::sys::window_server::WindowServerId;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 #[derive(Parser)]
@@ -20,11 +17,6 @@ use serde_json::Value;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
-}
-
-enum CliCommand {
-    Reactor(reactor::Command),
-    Config(rift_wm::common::config::ConfigCommand),
 }
 
 #[derive(Subcommand)]
@@ -83,15 +75,8 @@ enum QueryCommands {
     Window { window_id: String },
     /// List running applications
     Applications,
-    /// Get layout state and normalized container tree for a space
-    Layout {
-        /// macOS space ID; defaults to the active display space
-        #[arg(long)]
-        space_id: Option<u64>,
-        /// Virtual workspace index; defaults to the active workspace
-        #[arg(long)]
-        workspace_id: Option<usize>,
-    },
+    /// Get layout state for a space
+    Layout { space_id: u64 },
     /// Get workspace layout-engine mode(s)
     WorkspaceLayout {
         #[arg(long)]
@@ -465,12 +450,12 @@ enum DisplayCommands {
 enum SubscribeCommands {
     /// Subscribe to Mach IPC events
     Mach {
-        /// Event to subscribe to (workspace_changed, windows_changed, window_title_changed, focused_window_changed, stacks_changed, *)
+        /// Event to subscribe to (workspace_changed, windows_changed, window_title_changed, stacks_changed, *)
         event: String,
     },
     /// Subscribe to events via CLI command execution
     Cli {
-        /// Event to subscribe to (workspace_changed, windows_changed, window_title_changed, focused_window_changed, stacks_changed, *)
+        /// Event to subscribe to (workspace_changed, windows_changed, window_title_changed, stacks_changed, *)
         #[arg(long)]
         event: String,
         /// Command to execute when event occurs
@@ -581,14 +566,9 @@ fn build_query_request(query: QueryCommands) -> Result<RiftRequest, String> {
         QueryCommands::Workspaces { space_id } => Ok(RiftRequest::GetWorkspaces { space_id }),
         QueryCommands::Windows { space_id } => Ok(RiftRequest::GetWindows { space_id }),
         QueryCommands::Displays => Ok(RiftRequest::GetDisplays),
-        QueryCommands::Window { window_id } => {
-            let window_id = protocol_window_id(&parse_window_id(&window_id)?)?;
-            Ok(RiftRequest::GetWindowInfo { window_id })
-        }
+        QueryCommands::Window { window_id } => Ok(RiftRequest::GetWindowInfo { window_id }),
         QueryCommands::Applications => Ok(RiftRequest::GetApplications),
-        QueryCommands::Layout { space_id, workspace_id } => {
-            Ok(RiftRequest::GetLayoutState { space_id, workspace_id })
-        }
+        QueryCommands::Layout { space_id } => Ok(RiftRequest::GetLayoutState { space_id }),
         QueryCommands::WorkspaceLayout { space_id, workspace_id } => {
             Ok(RiftRequest::GetWorkspaceLayouts { space_id, workspace_id })
         }
@@ -598,20 +578,12 @@ fn build_query_request(query: QueryCommands) -> Result<RiftRequest, String> {
 
 fn build_subscribe_request(sub: SubscribeCommands) -> Result<RiftRequest, String> {
     match sub {
-        SubscribeCommands::Mach { event } => Ok(RiftRequest::Subscribe {
-            event: parse_event_kind(&event)?,
-        }),
-        SubscribeCommands::Cli { event, command, args } => Ok(RiftRequest::SubscribeCli {
-            event: parse_event_kind(&event)?,
-            command,
-            args,
-        }),
-        SubscribeCommands::UnsubMach { event } => Ok(RiftRequest::Unsubscribe {
-            event: parse_event_kind(&event)?,
-        }),
-        SubscribeCommands::UnsubCli { event } => Ok(RiftRequest::UnsubscribeCli {
-            event: parse_event_kind(&event)?,
-        }),
+        SubscribeCommands::Mach { event } => Ok(RiftRequest::Subscribe { event }),
+        SubscribeCommands::Cli { event, command, args } => {
+            Ok(RiftRequest::SubscribeCli { event, command, args })
+        }
+        SubscribeCommands::UnsubMach { event } => Ok(RiftRequest::Unsubscribe { event }),
+        SubscribeCommands::UnsubCli { event } => Ok(RiftRequest::UnsubscribeCli { event }),
         SubscribeCommands::ListCli => Ok(RiftRequest::ListCliSubscriptions),
     }
 }
@@ -628,7 +600,7 @@ fn build_execute_request(execute: ExecuteCommands) -> Result<RiftRequest, String
         ExecuteCommands::Display { display_cmd } => map_display_command(display_cmd)?,
         ExecuteCommands::Space { space_cmd } => map_space_command(space_cmd)?,
         ExecuteCommands::SaveAndExit => {
-            CliCommand::Reactor(reactor::Command::Reactor(reactor::ReactorCommand::SaveAndExit))
+            RiftCommand::Reactor(reactor::Command::Reactor(reactor::ReactorCommand::SaveAndExit))
         }
         ExecuteCommands::SaveLayout { file } => {
             let path = if file.master {
@@ -636,7 +608,7 @@ fn build_execute_request(execute: ExecuteCommands) -> Result<RiftRequest, String
             } else {
                 absolute_layout_path(file.path.expect("clap requires either PATH or --master"))?
             };
-            CliCommand::Reactor(reactor::Command::Reactor(reactor::ReactorCommand::SaveLayout {
+            RiftCommand::Reactor(reactor::Command::Reactor(reactor::ReactorCommand::SaveLayout {
                 path,
             }))
         }
@@ -661,59 +633,54 @@ fn build_execute_request(execute: ExecuteCommands) -> Result<RiftRequest, String
                 CliRestoreScope::Workspace => layout::RestoreScope::Workspace,
                 CliRestoreScope::Space => layout::RestoreScope::Space,
             };
-            CliCommand::Reactor(reactor::Command::Reactor(
+            RiftCommand::Reactor(reactor::Command::Reactor(
                 reactor::ReactorCommand::RestoreLayout { path, scope, source },
             ))
         }
         ExecuteCommands::Debug => {
-            CliCommand::Reactor(reactor::Command::Reactor(reactor::ReactorCommand::Debug))
+            RiftCommand::Reactor(reactor::Command::Reactor(reactor::ReactorCommand::Debug))
         }
         ExecuteCommands::Serialize => {
-            CliCommand::Reactor(reactor::Command::Reactor(reactor::ReactorCommand::Serialize))
+            RiftCommand::Reactor(reactor::Command::Reactor(reactor::ReactorCommand::Serialize))
         }
         #[allow(deprecated)]
         ExecuteCommands::ToggleSpaceActivated => {
             eprintln!("this command is deprecated, use rift-cli execute space toggle-activated");
-            CliCommand::Reactor(reactor::Command::Reactor(
+            RiftCommand::Reactor(reactor::Command::Reactor(
                 reactor::ReactorCommand::ToggleSpaceActivated,
             ))
         }
-        ExecuteCommands::ShowTiming => CliCommand::Reactor(reactor::Command::Metrics(
+        ExecuteCommands::ShowTiming => RiftCommand::Reactor(reactor::Command::Metrics(
             rift_wm::common::log::MetricsCommand::ShowTiming,
         )),
     };
 
-    if let CliCommand::Config(rift_wm::common::config::ConfigCommand::GetConfig) = &rift_command {
+    if let RiftCommand::Config(rift_wm::common::config::ConfigCommand::GetConfig) = &rift_command {
         return Ok(RiftRequest::GetConfig);
     }
 
-    let command = into_protocol_command(rift_command)?;
-    Ok(RiftRequest::ExecuteCommand { command })
-}
+    let maybe_config_json = match &rift_command {
+        RiftCommand::Config(cfg_cmd) => match serde_json::to_string(cfg_cmd) {
+            Ok(s) => Some(s),
+            Err(_) => None,
+        },
+        _ => None,
+    };
 
-fn into_protocol_command(command: CliCommand) -> Result<rift_protocol::RiftCommand, String> {
-    match command {
-        CliCommand::Config(command) => {
-            Ok(rift_protocol::RiftCommand::Config(decode_protocol(command)?))
-        }
-        CliCommand::Reactor(reactor::Command::Layout(command)) => {
-            Ok(rift_protocol::RiftCommand::Layout(decode_protocol(command)?))
-        }
-        CliCommand::Reactor(reactor::Command::Metrics(command)) => {
-            Ok(rift_protocol::RiftCommand::Metrics(decode_protocol(command)?))
-        }
-        CliCommand::Reactor(reactor::Command::Reactor(command)) => {
-            Ok(rift_protocol::RiftCommand::Reactor(decode_protocol(command)?))
-        }
+    let command_str = serde_json::to_string(&rift_command)
+        .map_err(|e| format!("Failed to serialize command: {}", e))?;
+
+    if let Some(cfg_json) = maybe_config_json {
+        Ok(RiftRequest::ExecuteCommand {
+            command: command_str,
+            args: vec!["__apply_config__".to_string(), cfg_json],
+        })
+    } else {
+        Ok(RiftRequest::ExecuteCommand {
+            command: command_str,
+            args: vec![],
+        })
     }
-}
-
-fn decode_protocol<T, U>(value: T) -> Result<U, String>
-where
-    T: Serialize,
-    U: DeserializeOwned, {
-    serde_json::from_value(serde_json::to_value(value).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())
 }
 
 fn absolute_layout_path(path: PathBuf) -> Result<PathBuf, String> {
@@ -726,11 +693,11 @@ fn absolute_layout_path(path: PathBuf) -> Result<PathBuf, String> {
     }
 }
 
-fn map_window_command(cmd: WindowCommands) -> Result<CliCommand, String> {
+fn map_window_command(cmd: WindowCommands) -> Result<RiftCommand, String> {
     use layout::LayoutCommand as LC;
     match cmd {
-        WindowCommands::Next => Ok(CliCommand::Reactor(reactor::Command::Layout(LC::NextWindow))),
-        WindowCommands::Prev => Ok(CliCommand::Reactor(reactor::Command::Layout(LC::PrevWindow))),
+        WindowCommands::Next => Ok(RiftCommand::Reactor(reactor::Command::Layout(LC::NextWindow))),
+        WindowCommands::Prev => Ok(RiftCommand::Reactor(reactor::Command::Layout(LC::PrevWindow))),
         WindowCommands::Focus {
             direction,
             window_id,
@@ -757,27 +724,25 @@ fn map_window_command(cmd: WindowCommands) -> Result<CliCommand, String> {
         WindowCommands::ToggleFloat => Ok(CliCommand::Reactor(reactor::Command::Layout(
             LC::ToggleWindowFloating,
         ))),
-        WindowCommands::ToggleFullscreen => Ok(CliCommand::Reactor(reactor::Command::Layout(
+        WindowCommands::ToggleFullscreen => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::ToggleFullscreen,
         ))),
-        WindowCommands::ToggleFullscreenWithinGaps => Ok(CliCommand::Reactor(
+        WindowCommands::ToggleFullscreenWithinGaps => Ok(RiftCommand::Reactor(
             reactor::Command::Layout(LC::ToggleFullscreenWithinGaps),
         )),
-        WindowCommands::ResizeGrow { orientation } => Ok(CliCommand::Reactor(
+        WindowCommands::ResizeGrow { orientation } => Ok(RiftCommand::Reactor(
             reactor::Command::Layout(LC::ResizeWindowGrow(orientation.into())),
         )),
-        WindowCommands::ResizeShrink { orientation } => Ok(CliCommand::Reactor(
+        WindowCommands::ResizeShrink { orientation } => Ok(RiftCommand::Reactor(
             reactor::Command::Layout(LC::ResizeWindowShrink(orientation.into())),
         )),
-        WindowCommands::ResizeBy { amount } => Ok(CliCommand::Reactor(reactor::Command::Layout(
+        WindowCommands::ResizeBy { amount } => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::ResizeWindowBy { amount },
         ))),
         WindowCommands::Close { window_id } => {
             let window_server_id = window_id.as_deref().map(parse_window_server_id).transpose()?;
-            Ok(CliCommand::Reactor(reactor::Command::Reactor(
-                reactor::ReactorCommand::CloseWindow {
-                    window_server_id: window_server_id.map(|id| id.as_u32()),
-                },
+            Ok(RiftCommand::Reactor(reactor::Command::Reactor(
+                reactor::ReactorCommand::CloseWindow { window_server_id },
             )))
         }
     }
@@ -807,23 +772,20 @@ fn parse_window_id(input: &str) -> Result<InternalWindowId, String> {
         return Ok(window_id);
     }
 
-    if let Some(window_id) = WindowId::from_debug_string(trimmed) {
-        return Ok(window_id);
-    }
+    if let Some((pid, idx)) = input.split_once(':') {
 
-    if let Some((pid, idx)) = trimmed.split_once(':') {
         let json_array = format!("[{},{}]", pid.trim(), idx.trim());
         return serde_json::from_str(&json_array).map_err(|e| {
             format!(
                 "Invalid window_id format '{}'. Expected 'pid:idx' (e.g., '1234:1'). Error: {}",
-                trimmed, e
+                input, e
             )
         });
     }
 
     Err(format!(
         "Invalid window id '{}'; expected 'pid:idx', '[pid,idx]', '{{\"pid\":123,\"idx\":1}}', or `WindowId {{ pid: 123, idx: 1 }}`",
-        trimmed
+        input
     ))
 }
 
@@ -862,100 +824,100 @@ fn parse_layout_mode(value: &str) -> Result<LayoutMode, String> {
     }
 }
 
-fn map_workspace_command(cmd: WorkspaceCommands) -> Result<CliCommand, String> {
+fn map_workspace_command(cmd: WorkspaceCommands) -> Result<RiftCommand, String> {
     use layout::LayoutCommand as LC;
     match cmd {
-        WorkspaceCommands::Next { skip_empty } => Ok(CliCommand::Reactor(
+        WorkspaceCommands::Next { skip_empty } => Ok(RiftCommand::Reactor(
             reactor::Command::Layout(LC::NextWorkspace(skip_empty)),
         )),
-        WorkspaceCommands::Prev { skip_empty } => Ok(CliCommand::Reactor(
+        WorkspaceCommands::Prev { skip_empty } => Ok(RiftCommand::Reactor(
             reactor::Command::Layout(LC::PrevWorkspace(skip_empty)),
         )),
-        WorkspaceCommands::Switch { workspace_id } => Ok(CliCommand::Reactor(
+        WorkspaceCommands::Switch { workspace_id } => Ok(RiftCommand::Reactor(
             reactor::Command::Layout(LC::SwitchToWorkspace(workspace_id)),
         )),
         WorkspaceCommands::MoveWindow {
             workspace_id,
             follow,
             window_id,
-        } => Ok(CliCommand::Reactor(reactor::Command::Layout(
+        } => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::MoveWindowToWorkspace {
                 workspace: WorkspaceSelector::Index(workspace_id),
                 follow,
                 window_id,
             },
         ))),
-        WorkspaceCommands::Create => Ok(CliCommand::Reactor(reactor::Command::Layout(
+        WorkspaceCommands::Create => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::CreateWorkspace,
         ))),
-        WorkspaceCommands::Last => Ok(CliCommand::Reactor(reactor::Command::Layout(
+        WorkspaceCommands::Last => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::SwitchToLastWorkspace,
         ))),
         WorkspaceCommands::SetLayout { workspace_id, mode } => {
             let mode = parse_layout_mode(&mode)?;
-            Ok(CliCommand::Reactor(reactor::Command::Layout(
+            Ok(RiftCommand::Reactor(reactor::Command::Layout(
                 LC::SetWorkspaceLayout { workspace: workspace_id, mode },
             )))
         }
     }
 }
 
-fn map_layout_command(cmd: LayoutCommands) -> Result<CliCommand, String> {
+fn map_layout_command(cmd: LayoutCommands) -> Result<RiftCommand, String> {
     use layout::LayoutCommand as LC;
     match cmd {
-        LayoutCommands::Ascend => Ok(CliCommand::Reactor(reactor::Command::Layout(LC::Ascend))),
-        LayoutCommands::Descend => Ok(CliCommand::Reactor(reactor::Command::Layout(LC::Descend))),
-        LayoutCommands::MoveNode { direction } => Ok(CliCommand::Reactor(
+        LayoutCommands::Ascend => Ok(RiftCommand::Reactor(reactor::Command::Layout(LC::Ascend))),
+        LayoutCommands::Descend => Ok(RiftCommand::Reactor(reactor::Command::Layout(LC::Descend))),
+        LayoutCommands::MoveNode { direction } => Ok(RiftCommand::Reactor(
             reactor::Command::Layout(LC::MoveNode(direction.into())),
         )),
-        LayoutCommands::JoinWindow { direction } => Ok(CliCommand::Reactor(
+        LayoutCommands::JoinWindow { direction } => Ok(RiftCommand::Reactor(
             reactor::Command::Layout(LC::JoinWindow(direction.into())),
         )),
-        LayoutCommands::ConsumeOrExpelWindow { direction } => Ok(CliCommand::Reactor(
+        LayoutCommands::ConsumeOrExpelWindow { direction } => Ok(RiftCommand::Reactor(
             reactor::Command::Layout(LC::ConsumeOrExpelWindow(direction.into())),
         )),
         LayoutCommands::ToggleStack => {
-            Ok(CliCommand::Reactor(reactor::Command::Layout(LC::ToggleStack)))
+            Ok(RiftCommand::Reactor(reactor::Command::Layout(LC::ToggleStack)))
         }
-        LayoutCommands::ToggleOrientation => Ok(CliCommand::Reactor(reactor::Command::Layout(
+        LayoutCommands::ToggleOrientation => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::ToggleOrientation,
         ))),
         LayoutCommands::Unjoin => {
-            Ok(CliCommand::Reactor(reactor::Command::Layout(LC::UnjoinWindows)))
+            Ok(RiftCommand::Reactor(reactor::Command::Layout(LC::UnjoinWindows)))
         }
-        LayoutCommands::ToggleFocusFloat => Ok(CliCommand::Reactor(reactor::Command::Layout(
+        LayoutCommands::ToggleFocusFloat => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::ToggleFocusFloating,
         ))),
-        LayoutCommands::AdjustMasterRatio { delta } => Ok(CliCommand::Reactor(
+        LayoutCommands::AdjustMasterRatio { delta } => Ok(RiftCommand::Reactor(
             reactor::Command::Layout(LC::AdjustMasterRatio(delta)),
         )),
-        LayoutCommands::AdjustMasterCount { delta } => Ok(CliCommand::Reactor(
+        LayoutCommands::AdjustMasterCount { delta } => Ok(RiftCommand::Reactor(
             reactor::Command::Layout(LC::AdjustMasterCount { delta }),
         )),
-        LayoutCommands::PromoteToMaster => Ok(CliCommand::Reactor(reactor::Command::Layout(
+        LayoutCommands::PromoteToMaster => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::PromoteToMaster,
         ))),
-        LayoutCommands::SwapMasterStack => Ok(CliCommand::Reactor(reactor::Command::Layout(
+        LayoutCommands::SwapMasterStack => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::SwapMasterStack,
         ))),
-        LayoutCommands::SwapWindows { a, b } => Ok(CliCommand::Reactor(reactor::Command::Layout(
-            LC::SwapWindows(parse_window_id(&a)?.into(), parse_window_id(&b)?.into()),
+        LayoutCommands::SwapWindows { a, b } => Ok(RiftCommand::Reactor(reactor::Command::Layout(
+            LC::SwapWindows(parse_window_id(&a)?, parse_window_id(&b)?),
         ))),
         LayoutCommands::ScrollStrip { delta } => {
-            Ok(CliCommand::Reactor(reactor::Command::Layout(LC::ScrollStrip {
+            Ok(RiftCommand::Reactor(reactor::Command::Layout(LC::ScrollStrip {
                 delta,
             })))
         }
         LayoutCommands::SnapStrip => {
-            Ok(CliCommand::Reactor(reactor::Command::Layout(LC::SnapStrip)))
+            Ok(RiftCommand::Reactor(reactor::Command::Layout(LC::SnapStrip)))
         }
-        LayoutCommands::CenterSelection => Ok(CliCommand::Reactor(reactor::Command::Layout(
+        LayoutCommands::CenterSelection => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::CenterSelection,
         ))),
     }
 }
 
-fn map_config_command(cmd: ConfigCommands) -> Result<CliCommand, String> {
+fn map_config_command(cmd: ConfigCommands) -> Result<RiftCommand, String> {
     use rift_wm::common::config::{AnimationEasing, ConfigCommand};
 
     let cfg_cmd = match cmd {
@@ -1036,18 +998,18 @@ fn map_config_command(cmd: ConfigCommands) -> Result<CliCommand, String> {
         ConfigCommands::Reload => ConfigCommand::ReloadConfig,
     };
 
-    Ok(CliCommand::Config(cfg_cmd))
+    Ok(RiftCommand::Config(cfg_cmd))
 }
 
-fn map_mission_control_command(cmd: MissionControlCommands) -> Result<CliCommand, String> {
+fn map_mission_control_command(cmd: MissionControlCommands) -> Result<RiftCommand, String> {
     match cmd {
-        MissionControlCommands::ShowAll => Ok(CliCommand::Reactor(reactor::Command::Reactor(
+        MissionControlCommands::ShowAll => Ok(RiftCommand::Reactor(reactor::Command::Reactor(
             reactor::ReactorCommand::ShowMissionControlAll,
         ))),
-        MissionControlCommands::ShowCurrent => Ok(CliCommand::Reactor(reactor::Command::Reactor(
+        MissionControlCommands::ShowCurrent => Ok(RiftCommand::Reactor(reactor::Command::Reactor(
             reactor::ReactorCommand::ShowMissionControlCurrent,
         ))),
-        MissionControlCommands::Dismiss => Ok(CliCommand::Reactor(reactor::Command::Reactor(
+        MissionControlCommands::Dismiss => Ok(RiftCommand::Reactor(reactor::Command::Reactor(
             reactor::ReactorCommand::DismissMissionControl,
         ))),
     }
@@ -1057,17 +1019,17 @@ fn map_display_command(cmd: DisplayCommands) -> Result<CliCommand, String> {
     match cmd {
         DisplayCommands::Focus { direction, index, uuid } => {
             let selector = build_display_selector(direction, index, uuid)?;
-            Ok(CliCommand::Reactor(reactor::Command::Reactor(
+            Ok(RiftCommand::Reactor(reactor::Command::Reactor(
                 reactor::ReactorCommand::FocusDisplay(selector),
             )))
         }
         DisplayCommands::MoveMouseToIndex { index } => {
-            Ok(CliCommand::Reactor(reactor::Command::Reactor(
+            Ok(RiftCommand::Reactor(reactor::Command::Reactor(
                 reactor::ReactorCommand::MoveMouseToDisplay(DisplaySelector::Index(index)),
             )))
         }
         DisplayCommands::MoveMouseToUuid { uuid } => {
-            Ok(CliCommand::Reactor(reactor::Command::Reactor(
+            Ok(RiftCommand::Reactor(reactor::Command::Reactor(
                 reactor::ReactorCommand::MoveMouseToDisplay(DisplaySelector::Uuid(uuid)),
             )))
         }
@@ -1076,7 +1038,7 @@ fn map_display_command(cmd: DisplayCommands) -> Result<CliCommand, String> {
             index,
             uuid,
             window_id,
-        } => Ok(CliCommand::Reactor(reactor::Command::Reactor(
+        } => Ok(RiftCommand::Reactor(reactor::Command::Reactor(
             reactor::ReactorCommand::MoveWindowToDisplay {
                 selector: build_display_selector(direction, index, uuid)?,
                 window_id,
@@ -1123,7 +1085,7 @@ fn parse_focus_direction(value: &str) -> Result<layout::Direction, String> {
     }
 }
 
-fn write_json<T: Serialize>(value: &T, pretty: bool) -> Result<(), String> {
+fn write_json(value: &Value, pretty: bool) -> Result<(), String> {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     let mut writer = io::BufWriter::new(&mut handle);
@@ -1139,12 +1101,11 @@ fn write_json<T: Serialize>(value: &T, pretty: bool) -> Result<(), String> {
 
 fn run_mach_subscription(event: String) -> Result<(), String> {
     let pretty = std::env::var("RIFT_CLI_PRETTY").map(|v| v != "0").unwrap_or(false);
-    let client = RiftMachClient::connect().map_err(|e| e.to_string())?;
-    let event_kind = parse_event_kind(&event)?;
-    let subscription = client.subscribe(event_kind).map_err(|e| e.to_string())?;
+    let client = RiftMachClient::connect()?;
+    let subscription = client.subscribe(event)?;
 
     loop {
-        let event_payload = subscription.recv_event().map_err(|e| e.to_string())?;
+        let event_payload = subscription.recv_event()?;
         // Exit cleanly when output is closed by the consumer.
         if let Err(e) = write_json(&event_payload, pretty) {
             if e.contains("Broken pipe") {
@@ -1152,40 +1113,5 @@ fn run_mach_subscription(event: String) -> Result<(), String> {
             }
             return Err(format!("Failed to write event output: {e}"));
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn execute_requests_use_typed_protocol_commands() {
-        let request = build_execute_request(ExecuteCommands::Window {
-            window_cmd: WindowCommands::Next,
-        })
-        .unwrap();
-
-        assert_eq!(
-            serde_json::to_value(request).unwrap(),
-            serde_json::json!({
-                "execute_command": { "command": { "layout": "next_window" } }
-            })
-        );
-    }
-
-    #[test]
-    fn config_commands_are_not_embedded_as_json_strings() {
-        let request = build_execute_request(ExecuteCommands::Config {
-            config_cmd: ConfigCommands::SetAnimate { value: "true".into() },
-        })
-        .unwrap();
-
-        assert_eq!(
-            serde_json::to_value(request).unwrap(),
-            serde_json::json!({
-                "execute_command": { "command": { "config": { "set_animate": true } } }
-            })
-        );
     }
 }
