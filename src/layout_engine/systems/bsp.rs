@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::actor::app::{WindowId, pid_t};
 use crate::common::collections::{HashMap, HashSet};
+use crate::common::config::WindowInsertionPoint;
 use crate::layout_engine::systems::constraints::{AxisConstraints, solve_axis_lengths};
 use crate::layout_engine::systems::{LayoutSystem, WindowLayoutConstraints};
 use crate::layout_engine::utils::compute_tiling_area;
@@ -35,6 +36,8 @@ pub struct BspLayoutSystem {
     tree: Tree<Components>,
     kind: slotmap::SecondaryMap<NodeId, NodeKind>,
     window_to_node: HashMap<WindowId, NodeId>,
+    #[serde(skip, default)]
+    window_insertion_point: WindowInsertionPoint,
 }
 
 impl BspLayoutSystem {
@@ -183,11 +186,23 @@ impl Default for BspLayoutSystem {
             tree: Tree::with_observer(Components::default()),
             kind: Default::default(),
             window_to_node: Default::default(),
+            window_insertion_point: WindowInsertionPoint::default(),
         }
     }
 }
 
 impl BspLayoutSystem {
+    pub fn new(window_insertion_point: WindowInsertionPoint) -> Self {
+        Self {
+            window_insertion_point,
+            ..Self::default()
+        }
+    }
+
+    pub fn set_window_insertion_point(&mut self, value: WindowInsertionPoint) {
+        self.window_insertion_point = value;
+    }
+
     fn index_window(&mut self, wid: WindowId, node: NodeId) {
         debug_assert!(
             matches!(self.kind.get(node), Some(NodeKind::Leaf { .. })),
@@ -1031,6 +1046,70 @@ impl LayoutSystem for BspLayoutSystem {
         }
     }
 
+    fn container_tree(&self, layout: LayoutId) -> rift_protocol::ContainerTreeNode {
+        fn snapshot(
+            system: &BspLayoutSystem,
+            node: NodeId,
+            selected: NodeId,
+        ) -> rift_protocol::ContainerTreeNode {
+            let weight = node.parent(&system.tree.map).and_then(|parent| {
+                let NodeKind::Split { ratio, .. } = system.kind.get(parent)? else {
+                    return None;
+                };
+                let first = parent.first_child(&system.tree.map);
+                Some(if first == Some(node) {
+                    f64::from(*ratio)
+                } else {
+                    1.0 - f64::from(*ratio)
+                })
+            });
+
+            match system.kind.get(node) {
+                Some(NodeKind::Split { orientation, .. }) => rift_protocol::ContainerTreeNode {
+                    node_type: rift_protocol::ContainerNodeType::Container,
+                    layout_kind: Some(rift_protocol::LayoutKind::from(*orientation)),
+                    weight,
+                    window_id: None,
+                    is_selected: node == selected,
+                    is_fullscreen: false,
+                    is_fullscreen_within_gaps: false,
+                    role: None,
+                    pending_split: None,
+                    children: node
+                        .children(&system.tree.map)
+                        .map(|child| snapshot(system, child, selected))
+                        .collect(),
+                },
+                Some(NodeKind::Leaf {
+                    window,
+                    fullscreen,
+                    fullscreen_within_gaps,
+                    preselected,
+                }) => rift_protocol::ContainerTreeNode {
+                    node_type: if window.is_some() {
+                        rift_protocol::ContainerNodeType::Window
+                    } else {
+                        rift_protocol::ContainerNodeType::Placeholder
+                    },
+                    layout_kind: None,
+                    weight,
+                    window_id: window.map(Into::into),
+                    is_selected: node == selected,
+                    is_fullscreen: *fullscreen,
+                    is_fullscreen_within_gaps: *fullscreen_within_gaps,
+                    role: None,
+                    pending_split: preselected.map(Into::into),
+                    children: Vec::new(),
+                },
+                None => unreachable!("BSP layout contains a node without metadata"),
+            }
+        }
+
+        let state = self.layouts.get(layout).expect("unknown BSP layout");
+        let selected = self.tree.data.selection.current_selection(state.root);
+        snapshot(self, state.root, selected)
+    }
+
     fn calculate_layout(
         &self,
         layout: LayoutId,
@@ -1141,6 +1220,18 @@ impl LayoutSystem for BspLayoutSystem {
 
     fn add_window_after_selection(&mut self, layout: LayoutId, wid: WindowId) {
         if self.layouts.get(layout).is_some() {
+            if self.window_insertion_point == WindowInsertionPoint::EndOfTree {
+                let root = self.layouts[layout].root;
+                if let Some(leaf) = root
+                    .traverse_preorder(&self.tree.map)
+                    .filter(|node| matches!(self.kind.get(*node), Some(NodeKind::Leaf { .. })))
+                    .last()
+                {
+                    self.tree.data.selection.select(&self.tree.map, leaf);
+                }
+                self.insert_window_at_selection(layout, wid);
+                return;
+            }
             // Try smart insertion first (with preselection support)
             if !self.smart_insert_window(layout, wid) {
                 // Fall back to default insertion

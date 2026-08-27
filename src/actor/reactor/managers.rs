@@ -1,4 +1,5 @@
 use objc2_core_foundation::{CGPoint, CGRect};
+use rift_protocol::StackInfo;
 use tracing::trace;
 
 use super::replay::Record;
@@ -15,7 +16,7 @@ use crate::actor::{
 use crate::common::collections::{HashMap, HashSet};
 use crate::common::config::{LayoutMode, WindowSnappingSettings};
 use crate::layout_engine::LayoutEngine;
-use crate::model::broadcast::{BroadcastEvent, BroadcastSender, StackInfo};
+use crate::model::broadcast::{BroadcastEvent, BroadcastSender, protocol_workspace_id};
 use crate::sys::screen::SpaceId;
 
 /// Manages application state and rules
@@ -117,6 +118,10 @@ pub struct RefreshQuarantineManager {
     pub awaiting_post_session_snapshot: bool,
     pub pending_visible_refresh: bool,
     pub deferred_refresh_tracks_mission_control: bool,
+    /// LoginWindow/AppKit can replay application activations while restoring a
+    /// session. Those activations are not user intent and must not drive a
+    /// virtual-workspace switch. Explicit input clears this latch.
+    pub suppress_auto_workspace_switch_until_input: bool,
 }
 
 impl RefreshQuarantineManager {
@@ -201,12 +206,13 @@ impl LayoutManager {
         reactor: &mut Reactor,
         is_resize: bool,
         is_workspace_switch: bool,
+        space_scope: Option<SpaceId>,
     ) -> Result<bool, crate::model::reactor::ReactorError> {
-        let layout_result = Self::calculate_layout(reactor);
+        let layout_result = Self::calculate_layout(reactor, space_scope);
         Self::apply_layout(reactor, layout_result, is_resize, is_workspace_switch)
     }
 
-    fn calculate_layout(reactor: &mut Reactor) -> LayoutResult {
+    fn calculate_layout(reactor: &mut Reactor, space_scope: Option<SpaceId>) -> LayoutResult {
         if reactor.state.windows.tracked_window_count() == 0 {
             return LayoutResult::new();
         }
@@ -223,6 +229,9 @@ impl LayoutManager {
             let Some(space) = screen.space else {
                 continue;
             };
+            if space_scope.is_some_and(|scope| scope != space) {
+                continue;
+            }
             if !reactor.is_space_active(space) {
                 continue;
             }
@@ -355,7 +364,20 @@ impl LayoutManager {
                     let stacks: Vec<StackInfo> = group_infos
                         .iter()
                         .map(|g| StackInfo {
-                            container_kind: g.container_kind,
+                            container_kind: match g.container_kind {
+                                crate::layout_engine::LayoutKind::Horizontal => {
+                                    rift_protocol::LayoutKind::Horizontal
+                                }
+                                crate::layout_engine::LayoutKind::Vertical => {
+                                    rift_protocol::LayoutKind::Vertical
+                                }
+                                crate::layout_engine::LayoutKind::HorizontalStack => {
+                                    rift_protocol::LayoutKind::HorizontalStack
+                                }
+                                crate::layout_engine::LayoutKind::VerticalStack => {
+                                    rift_protocol::LayoutKind::VerticalStack
+                                }
+                            },
                             total_count: g.total_count,
                             selected_index: g.selected_index,
                             windows: g.window_ids.iter().map(WindowId::to_debug_string).collect(),
@@ -364,13 +386,13 @@ impl LayoutManager {
 
                     if stacks.len() > 0 {
                         let event = BroadcastEvent::StacksChanged {
-                            workspace_id,
+                            workspace_id: protocol_workspace_id(workspace_id),
                             workspace_index,
                             workspace_name,
                             stacks,
                             active_workspace_has_fullscreen:
                                 active_workspace_for_space_has_fullscreen,
-                            space_id: space,
+                            space_id: space.get(),
                             display_uuid,
                         };
                         let _ = reactor.communication_manager.event_broadcaster.send(event);
@@ -378,9 +400,10 @@ impl LayoutManager {
                 }
             }
 
-            let suppress_animation = is_workspace_switch
-                || reactor.workspace_switch_manager.active_workspace_switch.is_some();
-            if suppress_animation {
+            if is_workspace_switch {
+                any_frame_changed |=
+                    AnimationManager::workspace_switch_layout(reactor, space, &layout, skip_wid);
+            } else if reactor.workspace_switch_manager.active_workspace_switch.is_some() {
                 any_frame_changed |=
                     AnimationManager::instant_layout(reactor, space, &layout, skip_wid);
             } else {
@@ -389,7 +412,6 @@ impl LayoutManager {
             }
         }
 
-        reactor.maybe_send_menu_update();
         Ok(any_frame_changed)
     }
 }

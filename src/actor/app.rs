@@ -27,15 +27,12 @@ use crate::common::collections::HashMap;
 use crate::model::tx_store::WindowTxStore;
 use crate::sys::app::NSRunningApplicationExt;
 pub use crate::sys::app::{AppInfo, WindowInfo, pid_t};
-use crate::sys::axuielement::{
-    AX_STANDARD_WINDOW_SUBROLE, AX_WINDOW_ROLE, AXUIElement, Error as AxError,
-};
-use crate::sys::enhanced_ui::with_enhanced_ui_disabled;
+use crate::sys::axuielement::{AX_STANDARD_WINDOW_SUBROLE, AXUIElement, Error as AxError};
+use crate::sys::enhanced_ui::EnhancedUi;
 use crate::sys::event;
 use crate::sys::executor::Executor;
 use crate::sys::observer::Observer;
 use crate::sys::process::ProcessInfo;
-use crate::sys::skylight::{G_CONNECTION, SLSDisableUpdate, SLSReenableUpdate};
 use crate::sys::timer::Timer;
 use crate::sys::window_server::{self, WindowServerId, WindowServerInfo};
 
@@ -96,7 +93,6 @@ const APP_NOTIFICATIONS: &[(AxNotificationKind, &str)] = &[
     (AxNotificationKind::WindowCreated, kAXWindowCreatedNotification),
     (AxNotificationKind::MenuOpened, kAXMenuOpenedNotification),
     (AxNotificationKind::MenuClosed, kAXMenuClosedNotification),
-    (AxNotificationKind::TitleChanged, kAXTitleChangedNotification),
 ];
 
 const WINDOW_NOTIFICATIONS: &[(AxNotificationKind, &str)] = &[
@@ -114,6 +110,7 @@ const WINDOW_NOTIFICATIONS: &[(AxNotificationKind, &str)] = &[
         AxNotificationKind::WindowDeminiaturized,
         kAXWindowDeminiaturizedNotification,
     ),
+    (AxNotificationKind::TitleChanged, kAXTitleChangedNotification),
 ];
 
 const WINDOW_ANIMATION_NOTIFICATIONS: &[AxNotificationKind] = &[
@@ -321,11 +318,18 @@ impl Debug for AppThreadHandle {
 pub enum Request {
     Terminate,
     GetVisibleWindows,
+    /// Reconcile the authoritative Carbon front-process change with AX state.
+    ///
+    /// Carbon supplies the activation edge, while the app thread resolves the
+    /// focused/main window and the quiet marker before notifying the reactor.
+    ApplicationGloballyActivated(pid_t),
     WindowMaybeDestroyed(WindowId),
     CloseWindow(Option<WindowServerId>),
 
     SetWindowFrame(WindowId, CGRect, TransactionId, bool),
     SetBatchWindowFrame(Vec<(WindowId, CGRect)>, TransactionId, bool),
+    /// Position-only batch reserved for virtual workspace switches.
+    SetWorkspaceSwitchPositions(Vec<(WindowId, CGPoint)>, TransactionId, bool),
     SetWindowPos(WindowId, CGPoint, TransactionId, bool),
     AnimationFrame {
         wid: WindowId,
@@ -344,6 +348,19 @@ pub enum Request {
     /// parameter for the last window only. Events for other windows will be
     /// marked `Quiet::Yes` automatically.
     Raise(Vec<WindowId>, CancellationToken, u64, Quiet),
+}
+
+impl Request {
+    #[inline]
+    fn disables_enhanced_ui(&self) -> bool {
+        match self {
+            Self::SetWindowFrame(_, _, _, enabled)
+            | Self::SetBatchWindowFrame(_, _, enabled)
+            | Self::SetWorkspaceSwitchPositions(_, _, enabled)
+            | Self::SetWindowPos(_, _, _, enabled) => *enabled,
+            _ => false,
+        }
+    }
 }
 
 struct RaiseRequest(Vec<WindowId>, CancellationToken, u64, Quiet);
@@ -379,9 +396,10 @@ struct State {
     last_window_idx: u32,
     main_window: Option<WindowId>,
     last_activated: Option<(Instant, Quiet, Option<WindowId>, oneshot::Sender<()>)>,
+    pending_activation_quiet: Option<(Instant, Quiet)>,
     is_hidden: bool,
     is_frontmost: bool,
-    active_animation_count: usize,
+    enhanced_ui: EnhancedUi,
     raises_tx: actor::Sender<RaiseRequest>,
     tx_store: Option<WindowTxStore>,
     pending_frames: HashMap<WindowId, PendingFrame>,
@@ -389,6 +407,7 @@ struct State {
 
 struct AppWindowState {
     pub elem: AXUIElement,
+    notifications_registered: bool,
     last_seen_txid: TransactionId,
     hidden_by_app: bool,
     window_server_id: Option<WindowServerId>,
@@ -540,27 +559,53 @@ impl State {
     }
 
     fn handle_request_batch(this: &RefCell<Self>, batch: Vec<(Span, Request)>) -> bool {
+        // All requests in this actor target the same application. Coalesce EUI
+        // suppression across the entire drained burst instead of toggling the
+        // app-level attribute once per window/request. Animation leases nest
+        // with this batch lease through the same refcount.
+        let disable_enhanced_ui = batch.iter().any(|(_, req)| req.disables_enhanced_ui());
+        if disable_enhanced_ui {
+            let mut state = this.borrow_mut();
+            let app = state.app.clone();
+            state.enhanced_ui.acquire(&app);
+        }
+
+        let mut should_terminate = false;
         for (span, request) in batch {
-            let mut this = this.borrow_mut();
+            let mut state = this.borrow_mut();
             let _guard = span.enter();
-            debug!(?this.bundle_id, ?this.pid, ?request, "Got request");
+            debug!(?state.bundle_id, ?state.pid, ?request, "Got request");
             let request_dbg = format!("{request:?}");
-            match this.handle_request(request) {
-                Ok(should_terminate) if should_terminate => return true,
-                Ok(_) => (),
+            match state.handle_request(request) {
+                Ok(true) => {
+                    should_terminate = true;
+                    break;
+                }
+                Ok(false) => (),
                 #[allow(non_upper_case_globals)]
-                Err(AxError::Ax(AXError::CannotComplete)) if this.running_app.isTerminated() => {
-                    warn!(?this.bundle_id, ?this.pid, "Application terminated without notification");
-                    this.send_event(Event::ApplicationThreadTerminated(this.pid));
-                    return true;
+                Err(AxError::Ax(AXError::CannotComplete)) if state.running_app.isTerminated() => {
+                    warn!(?state.bundle_id, ?state.pid, "Application terminated without notification");
+                    state.send_event(Event::ApplicationThreadTerminated(state.pid));
+                    should_terminate = true;
+                    break;
                 }
                 Err(err) => {
-                    warn!(?this.bundle_id, ?this.pid, request = %request_dbg, "Error handling request: {:?}", err);
+                    warn!(?state.bundle_id, ?state.pid, request = %request_dbg, "Error handling request: {:?}", err);
                 }
             }
         }
-        this.borrow_mut().flush_all_frames();
-        false
+
+        if !should_terminate {
+            this.borrow_mut().flush_all_frames();
+        }
+
+        if disable_enhanced_ui {
+            let mut state = this.borrow_mut();
+            let app = state.app.clone();
+            state.enhanced_ui.release(&app);
+        }
+
+        should_terminate
     }
 
     fn flush_frames(&mut self, wid: WindowId) -> Result<(), AxError> {
@@ -734,11 +779,16 @@ impl State {
             Request::GetVisibleWindows => {
                 self.refresh_visible_windows()?;
             }
-            Request::SetWindowPos(wid, pos, txid, eui) => {
-                let (elem, is_animating) = match self.window_mut(wid) {
+            Request::ApplicationGloballyActivated(pid) => {
+                if pid == self.pid {
+                    self.on_global_activation()?;
+                }
+            }
+            Request::SetWindowPos(wid, pos, txid, _) => {
+                let elem = match self.window_mut(wid) {
                     Ok(window) => {
                         window.last_seen_txid = txid;
-                        (window.elem.clone(), window.is_animating)
+                        window.elem.clone()
                     }
                     Err(err) => match err {
                         AxError::Ax(code) => {
@@ -747,23 +797,28 @@ impl State {
                             }
                             return Err(AxError::Ax(code));
                         }
-                        AxError::NotFound => {
-                            return Ok(false);
-                        }
+                        AxError::NotFound => return Ok(false),
                     },
                 };
 
-                if eui && !is_animating {
-                    let _ = with_enhanced_ui_disabled(&self.app, || elem.set_position(pos));
-                } else {
-                    let _ = elem.set_position(pos);
-                };
+                let _ = elem.set_position(pos);
 
-                let frame =
+                let mut frame =
                     match self.handle_ax_result(wid, trace("frame", &elem, || elem.frame()))? {
                         Some(frame) => frame,
                         None => return Ok(false),
                     };
+
+                // one retry
+                if frame.origin.x != pos.x || frame.origin.y != pos.y {
+                    warn!("set_position failed, retrying");
+                    let _ = elem.set_position(pos);
+                    frame =
+                        match self.handle_ax_result(wid, trace("frame", &elem, || elem.frame()))? {
+                            Some(frame) => frame,
+                            None => return Ok(false),
+                        };
+                }
 
                 self.send_event(Event::WindowFrameChanged(
                     wid,
@@ -781,11 +836,11 @@ impl State {
                     txid,
                 });
             }
-            Request::SetWindowFrame(wid, desired, txid, eui) => {
-                let (elem, is_animating) = match self.window_mut(wid) {
+            Request::SetWindowFrame(wid, desired, txid, _) => {
+                let elem = match self.window_mut(wid) {
                     Ok(window) => {
                         window.last_seen_txid = txid;
-                        (window.elem.clone(), window.is_animating)
+                        window.elem.clone()
                     }
                     Err(err) => match err {
                         AxError::Ax(code) => {
@@ -798,17 +853,9 @@ impl State {
                     },
                 };
 
-                if eui && !is_animating {
-                    with_enhanced_ui_disabled(&self.app, || {
-                        let _ = elem.set_size(desired.size);
-                        let _ = elem.set_position(desired.origin);
-                        let _ = elem.set_size(desired.size);
-                    });
-                } else {
-                    let _ = elem.set_size(desired.size);
-                    let _ = elem.set_position(desired.origin);
-                    let _ = elem.set_size(desired.size);
-                }
+                let _ = elem.set_size(desired.size);
+                let _ = elem.set_position(desired.origin);
+                let _ = elem.set_size(desired.size);
 
                 let frame =
                     match self.handle_ax_result(wid, trace("frame", &elem, || elem.frame()))? {
@@ -824,25 +871,16 @@ impl State {
                     None,
                 ));
             }
-            Request::SetBatchWindowFrame(frames, txid, eui) => {
-                let disable_eui_for_batch = eui
-                    && frames.iter().any(|(wid, _)| {
-                        self.windows.get(wid).is_some_and(|window| !window.is_animating)
-                    });
-
-                if disable_eui_for_batch {
-                    let _ = self.app.set_bool_attribute("AXEnhancedUserInterface", false);
-                }
-
-                for (wid, desired) in frames.iter() {
-                    let (elem, is_animating) = match self.window_mut(*wid) {
+            Request::SetBatchWindowFrame(frames, txid, _) => {
+                for (wid, desired) in frames {
+                    let elem = match self.window_mut(wid) {
                         Ok(window) => {
                             window.last_seen_txid = txid;
-                            (window.elem.clone(), window.is_animating)
+                            window.elem.clone()
                         }
                         Err(err) => match err {
                             AxError::Ax(code) => {
-                                if self.handle_ax_error(*wid, &code) {
+                                if self.handle_ax_error(wid, &code) {
                                     continue;
                                 }
                                 return Err(AxError::Ax(code));
@@ -851,41 +889,61 @@ impl State {
                         },
                     };
 
-                    if disable_eui_for_batch || (eui && !is_animating) {
-                        if disable_eui_for_batch {
-                            let _ = elem.set_size(desired.size);
-                            let _ = elem.set_position(desired.origin);
-                            let _ = elem.set_size(desired.size);
-                        } else {
-                            with_enhanced_ui_disabled(&self.app, || {
-                                let _ = elem.set_size(desired.size);
-                                let _ = elem.set_position(desired.origin);
-                                let _ = elem.set_size(desired.size);
-                            });
-                        }
-                    } else {
-                        let _ = elem.set_size(desired.size);
-                        let _ = elem.set_position(desired.origin);
-                        let _ = elem.set_size(desired.size);
-                    }
+                    let _ = elem.set_size(desired.size);
+                    let _ = elem.set_position(desired.origin);
+                    let _ = elem.set_size(desired.size);
 
-                    let frame = match self
-                        .handle_ax_result(*wid, trace("frame", &elem, || elem.frame()))?
-                    {
-                        Some(frame) => frame,
-                        None => continue,
-                    };
+                    let frame =
+                        match self.handle_ax_result(wid, trace("frame", &elem, || elem.frame()))? {
+                            Some(frame) => frame,
+                            None => continue,
+                        };
 
                     self.send_event(Event::WindowFrameChanged(
-                        *wid,
+                        wid,
                         frame,
                         Some(txid),
                         Requested(true),
                         None,
                     ));
                 }
-                if disable_eui_for_batch {
-                    let _ = self.app.set_bool_attribute("AXEnhancedUserInterface", true);
+            }
+            Request::SetWorkspaceSwitchPositions(positions, txid, _) => {
+                for (wid, position) in positions {
+                    let elem = match self.window_mut(wid) {
+                        Ok(window) => {
+                            window.last_seen_txid = txid;
+                            window.elem.clone()
+                        }
+                        Err(err) => match err {
+                            AxError::Ax(code) => {
+                                if self.handle_ax_error(wid, &code) {
+                                    continue;
+                                }
+                                return Err(AxError::Ax(code));
+                            }
+                            AxError::NotFound => continue,
+                        },
+                    };
+
+                    let _ = elem.set_position(position);
+
+                    // Preserve the existing per-window acknowledgement semantics. In
+                    // particular, report the frame AX actually accepted rather than the
+                    // requested position combined with a cached size.
+                    let frame =
+                        match self.handle_ax_result(wid, trace("frame", &elem, || elem.frame()))? {
+                            Some(frame) => frame,
+                            None => continue,
+                        };
+
+                    self.send_event(Event::WindowFrameChanged(
+                        wid,
+                        frame,
+                        Some(txid),
+                        Requested(true),
+                        None,
+                    ));
                 }
             }
             Request::BeginWindowAnimation(wid) => {
@@ -896,14 +954,10 @@ impl State {
                     (window.elem.clone(), started_animation)
                 };
                 if started_animation {
-                    self.active_animation_count += 1;
-                }
-                if started_animation && self.active_animation_count == 1 {
-                    let _ = self.app.set_bool_attribute("AXEnhancedUserInterface", false);
+                    let app = self.app.clone();
+                    self.enhanced_ui.acquire(&app);
                 }
                 self.stop_notifications_for_animation(&elem);
-
-                SLSDisableUpdate(*G_CONNECTION);
             }
             Request::EndWindowAnimation(wid) => {
                 if let Err(err) = self.flush_frames(wid) {
@@ -941,10 +995,8 @@ impl State {
                     let _ = elem.set_size(frame.size);
                 }
                 if ended_animation {
-                    self.active_animation_count = self.active_animation_count.saturating_sub(1);
-                }
-                if ended_animation && self.active_animation_count == 0 {
-                    let _ = self.app.set_bool_attribute("AXEnhancedUserInterface", true);
+                    let app = self.app.clone();
+                    self.enhanced_ui.release(&app);
                 }
                 self.restart_notifications_after_animation(&elem);
                 let frame =
@@ -959,7 +1011,6 @@ impl State {
                     Requested(true),
                     None,
                 ));
-                SLSReenableUpdate(*G_CONNECTION);
             }
             Request::Raise(wids, token, sequence_id, quiet) => {
                 self.raises_tx.send(RaiseRequest(wids, token, sequence_id, quiet));
@@ -980,9 +1031,7 @@ impl State {
             AxNotificationKind::ApplicationHidden => self.on_application_hidden(),
             AxNotificationKind::ApplicationShown => self.on_application_shown(),
             AxNotificationKind::ApplicationActivated
-            | AxNotificationKind::ApplicationDeactivated => {
-                _ = self.on_activation_changed();
-            }
+            | AxNotificationKind::ApplicationDeactivated => _ = self.on_ax_activation_changed(),
             AxNotificationKind::MainWindowChanged => {
                 // `AXWindows` is filtered to the current macOS space, so using it as
                 // a membership list here will incorrectly "destroy" windows that
@@ -1014,6 +1063,14 @@ impl State {
                 let Ok(wid) = self.wid_for_notification(&elem, hinted_wid) else {
                     return;
                 };
+                // A refreshed AXUIElement can reuse the same stable WindowServer-backed
+                // WindowId. Removing by the callback's encoded wid would then let a late
+                // destroy notification for the superseded element tear down the replacement.
+                // Only the element currently bound to this wid owns its lifetime.
+                if !self.is_current_window_element(wid, &elem) {
+                    trace!(?wid, "Ignoring destroy notification for superseded AX element");
+                    return;
+                }
                 if self.remove_window(wid).is_none() {
                     return;
                 }
@@ -1025,6 +1082,10 @@ impl State {
                 let Ok(wid) = self.wid_for_notification(&elem, hinted_wid) else {
                     return;
                 };
+                if !self.is_current_window_element(wid, &elem) {
+                    trace!(?wid, ?notif, "Ignoring notification for superseded AX element");
+                    return;
+                }
 
                 let txid = match self.window(wid) {
                     Ok(window) => {
@@ -1080,24 +1141,34 @@ impl State {
                 let Ok(wid) = self.wid_for_notification(&elem, hinted_wid) else {
                     return;
                 };
-                if let Some(window) = self.windows.get_mut(&wid) {
-                    window.hidden_by_app = false;
-                }
+                let Some(window) = self.windows.get_mut(&wid).filter(|window| window.elem == elem)
+                else {
+                    trace!(?wid, "Ignoring miniaturize for superseded AX element");
+                    return;
+                };
+                window.hidden_by_app = false;
                 self.send_event(Event::WindowMinimized(wid));
             }
             AxNotificationKind::WindowDeminiaturized => {
                 let Ok(wid) = self.wid_for_notification(&elem, hinted_wid) else {
                     return;
                 };
-                if let Some(window) = self.windows.get_mut(&wid) {
-                    window.hidden_by_app = false;
-                }
+                let Some(window) = self.windows.get_mut(&wid).filter(|window| window.elem == elem)
+                else {
+                    trace!(?wid, "Ignoring deminiaturize for superseded AX element");
+                    return;
+                };
+                window.hidden_by_app = false;
                 self.send_event(Event::WindowDeminiaturized(wid));
             }
             AxNotificationKind::TitleChanged => {
                 let Ok(wid) = self.wid_for_notification(&elem, hinted_wid) else {
                     return;
                 };
+                if !self.is_current_window_element(wid, &elem) {
+                    trace!(?wid, "Ignoring title change for superseded AX element");
+                    return;
+                }
                 match elem.title() {
                     Ok(title) => {
                         let Ok(window) = self.window_mut(wid) else {
@@ -1326,43 +1397,70 @@ impl State {
         Some(wid)
     }
 
-    fn on_activation_changed(&mut self) -> Result<(), AxError> {
-        // TODO: this prolly isnt needed
-        let is_frontmost = trace("is_frontmost", &self.app, || self.app.frontmost())?;
-        let old_frontmost = std::mem::replace(&mut self.is_frontmost, is_frontmost);
-        debug!(
-            "on_activation_changed, pid={:?}, is_frontmost={:?}, old_frontmost={:?}",
-            self.pid, is_frontmost, old_frontmost
-        );
-
-        let event = if !is_frontmost {
-            Event::ApplicationDeactivated(self.pid)
-        } else {
-            let (quiet_activation, quiet_window_change) = match self.last_activated.take() {
-                Some((ts, quiet_activation, quiet_window_change, tx)) => {
-                    _ = tx.send(());
-                    if ts.elapsed() < Duration::from_millis(1000) {
-                        trace!("by us");
-                        (quiet_activation, quiet_window_change)
-                    } else {
-                        trace!("by user");
-                        (Quiet::No, None)
-                    }
-                }
-                None => {
+    fn take_activation_context(&mut self) -> (Quiet, Option<WindowId>) {
+        match self.last_activated.take() {
+            Some((ts, quiet_activation, quiet_window_change, tx)) => {
+                _ = tx.send(());
+                if ts.elapsed() < Duration::from_millis(1000) {
+                    trace!("by us");
+                    (quiet_activation, quiet_window_change)
+                } else {
                     trace!("by user");
                     (Quiet::No, None)
                 }
-            };
+            }
+            None => {
+                trace!("by user");
+                (Quiet::No, None)
+            }
+        }
+    }
 
+    fn on_ax_activation_changed(&mut self) -> Result<(), AxError> {
+        let is_frontmost = trace("is_frontmost", &self.app, || self.app.frontmost())?;
+        let old_frontmost = std::mem::replace(&mut self.is_frontmost, is_frontmost);
+        debug!(
+            "on_ax_activation_changed, pid={:?}, is_frontmost={:?}, old_frontmost={:?}",
+            self.pid, is_frontmost, old_frontmost
+        );
+
+        if !is_frontmost {
+            self.pending_activation_quiet = None;
+            if old_frontmost {
+                self.send_event(Event::ApplicationDeactivated(self.pid));
+            }
+        } else if !old_frontmost {
+            let (quiet, quiet_window_change) = self.take_activation_context();
             self.on_main_window_changed(quiet_window_change, true);
+            self.pending_activation_quiet = Some((Instant::now(), quiet));
+        }
+        Ok(())
+    }
 
-            Event::ApplicationActivated(self.pid, quiet_activation)
+    fn on_global_activation(&mut self) -> Result<(), AxError> {
+        let (quiet, quiet_window_change) = if self.last_activated.is_some() {
+            self.take_activation_context()
+        } else if let Some((ts, quiet)) = self.pending_activation_quiet.take()
+            && ts.elapsed() < Duration::from_millis(1000)
+        {
+            (quiet, None)
+        } else {
+            (Quiet::No, None)
         };
 
-        if old_frontmost != is_frontmost {
-            self.send_event(event);
+        // Carbon is the authoritative inter-application activation edge. AX
+        // frontmost polling/notifications can lag it, so do not reject this
+        // request based on a transient AX value.
+        self.is_frontmost = true;
+        if self.on_main_window_changed(quiet_window_change, true).is_none()
+            && self.main_window.take().is_some()
+        {
+            // Do not let the reactor reuse a previous window as the target for
+            // this authoritative activation when AX cannot resolve the current
+            // main window. This event is queued before ApplicationActivated.
+            self.send_event(Event::ApplicationMainWindowChanged(self.pid, None, Quiet::No));
         }
+        self.send_event(Event::ApplicationActivated(self.pid, quiet));
         Ok(())
     }
 
@@ -1527,14 +1625,17 @@ impl State {
             return None;
         }
 
-        if !self.register_window_notifications(&elem, wid) {
-            return None;
-        }
+        // Some applications expose real WindowServer-backed windows through a
+        // non-AXWindow element (for example Emacs reports AXTextField). Keep
+        // those elements registered even when per-window AX notifications are
+        // unavailable; app-level discovery remains the lifecycle fallback.
+        let notifications_registered = self.register_window_notifications(&elem, wid);
         let hidden_by_app = self.is_hidden;
         let last_seen_txid = self.txid_from_store(window_server_id).unwrap_or_default();
 
         let old = self.windows.insert(wid, AppWindowState {
             elem: elem.clone(),
+            notifications_registered,
             last_seen_txid,
             hidden_by_app,
             window_server_id,
@@ -1551,10 +1652,7 @@ impl State {
     }
 
     fn register_window_notifications(&self, elem: &AXUIElement, wid: WindowId) -> bool {
-        match elem.role() {
-            Ok(role) if role == AX_WINDOW_ROLE => (),
-            _ => return false,
-        }
+        let mut registered_all = true;
         for &(kind, notif) in WINDOW_NOTIFICATIONS {
             let res = self.observer.add_notification_with_data(
                 elem,
@@ -1568,16 +1666,22 @@ impl State {
                 );
                 if !is_already_registered {
                     trace!("Watching failed with error {err:?} on window {elem:#?}");
-                    return false;
+                    registered_all = false;
                 }
             }
         }
-        true
+        registered_all
     }
 
     fn rebind_window_element(&mut self, wid: WindowId, elem: AXUIElement, info: &WindowInfo) {
-        let Some((old_elem, was_animating)) =
-            self.windows.get(&wid).map(|window| (window.elem.clone(), window.is_animating))
+        let Some((old_elem, was_animating, old_notifications_registered)) =
+            self.windows.get(&wid).map(|window| {
+                (
+                    window.elem.clone(),
+                    window.is_animating,
+                    window.notifications_registered,
+                )
+            })
         else {
             return;
         };
@@ -1590,7 +1694,8 @@ impl State {
         // context in that case, so a late notification remains memory-safe and its
         // encoded wid still resolves to this logical window.
         self.remove_window_notifications(&old_elem);
-        if !self.register_window_notifications(&elem, wid) {
+        let notifications_registered = self.register_window_notifications(&elem, wid);
+        if !notifications_registered && old_notifications_registered {
             // Keep the last usable binding and restore its notifications when the
             // replacement cannot yet be observed. A later AXWindows refresh retries.
             self.remove_window_notifications(&elem);
@@ -1605,6 +1710,7 @@ impl State {
         self.elem_to_wid.insert(elem.clone(), wid);
         if let Some(window) = self.windows.get_mut(&wid) {
             window.elem = elem;
+            window.notifications_registered = notifications_registered;
             window.window_server_id = info.sys_id.or(window.window_server_id);
             window.title = info.title.clone();
         }
@@ -1742,6 +1848,10 @@ impl State {
             .ok_or(AxError::NotFound)
     }
 
+    fn is_current_window_element(&self, wid: WindowId, elem: &AXUIElement) -> bool {
+        self.windows.get(&wid).is_some_and(|window| window.elem == *elem)
+    }
+
     fn stop_notifications_for_animation(&self, elem: &AXUIElement) {
         for &kind in WINDOW_ANIMATION_NOTIFICATIONS {
             let res = self.observer.remove_notification(elem, kind.name());
@@ -1784,10 +1894,8 @@ impl State {
         let window = self.windows.remove(&wid)?;
         self.elem_to_wid.remove(&window.elem);
         if window.is_animating {
-            self.active_animation_count = self.active_animation_count.saturating_sub(1);
-        }
-        if window.is_animating && self.active_animation_count == 0 {
-            let _ = self.app.set_bool_attribute("AXEnhancedUserInterface", true);
+            let app = self.app.clone();
+            self.enhanced_ui.release(&app);
         }
         Some(window)
     }
@@ -1798,6 +1906,7 @@ impl Drop for State {
         if let Some((_, _, _, tx)) = self.last_activated.take() {
             let _ = tx.send(());
         }
+        self.enhanced_ui.restore_if_needed(&self.app);
     }
 }
 
@@ -1840,6 +1949,14 @@ fn app_thread_main(
     });
 
     let (raises_tx, raises_rx) = actor::channel();
+    let mut info = info;
+    if info.bundle_id.is_none() {
+        info.bundle_id = bundle_id.as_deref().map(ToString::to_string);
+    }
+    if info.localized_name.is_none() {
+        info.localized_name = running_app.localizedName().as_deref().map(ToString::to_string);
+    }
+
     let state = State {
         pid,
         running_app,
@@ -1852,9 +1969,10 @@ fn app_thread_main(
         last_window_idx: 0,
         main_window: None,
         last_activated: None,
+        pending_activation_quiet: None,
         is_hidden: false,
         is_frontmost: false,
-        active_animation_count: 0,
+        enhanced_ui: EnhancedUi::default(),
         raises_tx,
         tx_store,
         pending_frames: HashMap::default(),

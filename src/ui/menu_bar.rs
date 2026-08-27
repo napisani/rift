@@ -1,4 +1,6 @@
 // many ideas for how this works were taken from https://github.com/xiamaz/YabaiIndicator
+#[cfg(test)]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -31,10 +33,8 @@ use crate::common::config::{
     WorkspaceSelector, restore_file,
 };
 use crate::layout_engine::{LayoutCommand, LayoutEngine, RestoreScope, RestoreSource};
-use crate::model::VirtualWorkspaceId;
-use crate::model::server::{WindowData, WorkspaceData};
+use crate::model::server::RuntimeWorkspaceData;
 use crate::sys::hotkey::{Hotkey, KeyCode, Modifiers};
-use crate::sys::screen::SpaceId;
 use crate::ui::common::compute_window_layout_metrics;
 
 const CELL_WIDTH: f64 = 20.0;
@@ -44,6 +44,11 @@ const CORNER_RADIUS: f64 = 3.0;
 const BORDER_WIDTH: f64 = 1.0;
 const CONTENT_INSET: f64 = 2.0;
 const FONT_SIZE: f64 = 12.0;
+
+#[cfg(test)]
+thread_local! {
+    static LAYOUT_LIBRARY_SCANS: Cell<usize> = const { Cell::new(0) };
+}
 
 #[derive(Debug, Clone)]
 pub enum MenuAction {
@@ -73,10 +78,49 @@ pub enum MenuAction {
 pub struct MenuIcon {
     status_item: Retained<NSStatusItem>,
     view: Retained<MenuIconView>,
-    menu: Retained<NSMenu>,
+    _menu: Retained<NSMenu>,
     menu_handler: Retained<MenuActionHandler>,
+    layout_items: Vec<(LayoutMode, Retained<NSMenuItem>)>,
+    workspace_item: Retained<NSMenuItem>,
+    workspace_submenu: Retained<NSMenu>,
+    workspace_items: Vec<WorkspaceMenuItem>,
+    next_workspace_item: Retained<NSMenuItem>,
+    prev_workspace_item: Retained<NSMenuItem>,
+    tiling_item: Retained<NSMenuItem>,
+    reload_item: Retained<NSMenuItem>,
+    quit_item: Retained<NSMenuItem>,
+    restore_workspace_menu: Retained<NSMenu>,
+    restore_space_menu: Retained<NSMenu>,
+    layout_folder: PathBuf,
     mtm: MainThreadMarker,
     prev_width: f64,
+}
+
+struct WorkspaceMenuItem {
+    identity: String,
+    index: usize,
+    name: String,
+    item: Retained<NSMenuItem>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceTopology {
+    identity: String,
+    index: usize,
+    name: String,
+}
+
+#[cfg(test)]
+fn workspace_topology(workspaces: &[RuntimeWorkspaceData]) -> Vec<WorkspaceTopology> {
+    workspaces
+        .iter()
+        .map(|workspace| WorkspaceTopology {
+            identity: workspace.id.clone(),
+            index: workspace.index,
+            name: workspace.name.clone(),
+        })
+        .collect()
 }
 
 impl MenuIcon {
@@ -89,135 +133,186 @@ impl MenuIcon {
         let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
         let view = MenuIconView::new(mtm);
         let menu_handler = MenuActionHandler::new(mtm, action_tx);
-        let menu = build_status_menu(
-            mtm,
-            &menu_handler,
-            None,
-            SpaceId::new(0),
-            true,
-            &[],
-            &MenuShortcuts::default(),
-            layout_folder,
-        );
-        status_item.setMenu(Some(&menu));
+        let built = build_static_menu(mtm, &menu_handler);
+        status_item.setMenu(Some(&built.menu));
         if let Some(btn) = status_item.button(mtm) {
             btn.addSubview(&*view);
             view.setFrameSize(NSSize::new(0.0, 0.0));
             status_item.setVisible(true);
         }
 
-        Self {
+        let mut this = Self {
             status_item,
             view,
-            menu,
+            _menu: built.menu,
             menu_handler,
+            layout_items: built.layout_items,
+            workspace_item: built.workspace_item,
+            workspace_submenu: built.workspace_submenu,
+            workspace_items: Vec::new(),
+            next_workspace_item: built.next_workspace_item,
+            prev_workspace_item: built.prev_workspace_item,
+            tiling_item: built.tiling_item,
+            reload_item: built.reload_item,
+            quit_item: built.quit_item,
+            restore_workspace_menu: built.restore_workspace_menu,
+            restore_space_menu: built.restore_space_menu,
+            layout_folder: layout_folder.to_path_buf(),
             mtm,
             prev_width: 0.0,
+        };
+        this.menu_handler.set_layout_folder(layout_folder.to_path_buf());
+        this.refresh_layout_library();
+        this
+    }
+
+    pub fn update_config(&mut self, settings: &MenuBarSettings, hotkeys: &[(Hotkey, WmCommand)]) {
+        let shortcuts = MenuShortcuts::from_hotkeys(hotkeys);
+        set_menu_item_hotkey(&self.next_workspace_item, shortcuts.next_workspace.as_ref());
+        set_menu_item_hotkey(&self.prev_workspace_item, shortcuts.prev_workspace.as_ref());
+        set_menu_item_hotkey(&self.tiling_item, shortcuts.toggle_space_activation.as_ref());
+        set_menu_item_hotkey(&self.reload_item, shortcuts.reload_config.as_ref());
+        set_menu_item_hotkey(&self.quit_item, shortcuts.quit_rift.as_ref());
+        for workspace in &self.workspace_items {
+            let shortcut = shortcuts
+                .switch_workspace_by_index
+                .get(&workspace.index)
+                .or_else(|| shortcuts.switch_workspace_by_name.get(&workspace.name));
+            set_menu_item_hotkey(&workspace.item, shortcut);
+        }
+
+        let layout_folder = settings.resolved_layout_folder();
+        if layout_folder != self.layout_folder {
+            self.layout_folder = layout_folder.clone();
+            self.menu_handler.set_layout_folder(layout_folder);
+            self.refresh_layout_library();
         }
     }
 
-    pub fn update(
+    pub fn sync_workspace_topology(
         &mut self,
-        active_space: SpaceId,
-        active_space_is_activated: bool,
-        workspaces: &[WorkspaceData],
-        _active_workspace: Option<VirtualWorkspaceId>,
-        _windows: &[WindowData],
-        settings: &MenuBarSettings,
+        workspaces: &[RuntimeWorkspaceData],
         hotkeys: &[(Hotkey, WmCommand)],
     ) {
-        let active_layout = workspaces
-            .iter()
-            .find(|w| w.is_active)
-            .and_then(|w| parse_layout_mode(&w.layout_mode));
+        let unchanged = self.workspace_items.len() == workspaces.len()
+            && self.workspace_items.iter().zip(workspaces).all(|(item, workspace)| {
+                item.identity == workspace.id
+                    && item.index == workspace.index
+                    && item.name == workspace.name
+            });
+        if unchanged {
+            return;
+        }
+
+        for workspace in self.workspace_items.drain(..) {
+            self.workspace_submenu.removeItem(&workspace.item);
+        }
+
         let shortcuts = MenuShortcuts::from_hotkeys(hotkeys);
-        let menu = build_status_menu(
+        for workspace in workspaces {
+            let item = make_menu_item(
+                self.mtm,
+                &workspace_menu_title(workspace),
+                Some(sel!(onSwitchWorkspace:)),
+                Some(&self.menu_handler),
+            );
+            item.setTag(workspace.index as isize);
+            set_menu_item_checked(&item, workspace.is_active);
+            set_menu_item_hotkey(
+                &item,
+                shortcuts
+                    .switch_workspace_by_index
+                    .get(&workspace.index)
+                    .or_else(|| shortcuts.switch_workspace_by_name.get(&workspace.name)),
+            );
+            self.workspace_submenu.addItem(&item);
+            self.workspace_items.push(WorkspaceMenuItem {
+                identity: workspace.id.clone(),
+                index: workspace.index,
+                name: workspace.name.clone(),
+                item,
+            });
+        }
+
+        self.workspace_item.setEnabled(!workspaces.is_empty());
+    }
+
+    pub fn update_menu_state(
+        &self,
+        active_space_is_activated: bool,
+        workspaces: &[RuntimeWorkspaceData],
+    ) {
+        let active = workspaces.iter().find(|workspace| workspace.is_active);
+        let active_layout = active.and_then(|workspace| parse_layout_mode(&workspace.layout_mode));
+        let active_id = active.map(|workspace| workspace.id.as_str());
+
+        for (mode, item) in &self.layout_items {
+            set_menu_item_checked(item, active_layout == Some(*mode));
+        }
+        for workspace in &self.workspace_items {
+            set_menu_item_checked(&workspace.item, active_id == Some(workspace.identity.as_str()));
+        }
+        set_menu_item_checked(&self.tiling_item, active_space_is_activated);
+    }
+
+    pub fn refresh_layout_library(&mut self) {
+        let files = layout_library_files_in(&self.layout_folder);
+        self.menu_handler
+            .set_layout_files(files.iter().map(|(_, path)| path.clone()).collect());
+
+        rebuild_restore_menu(
             self.mtm,
             &self.menu_handler,
-            active_layout,
-            active_space,
-            active_space_is_activated,
-            workspaces,
-            &shortcuts,
-            &settings.resolved_layout_folder(),
+            &self.restore_workspace_menu,
+            &files,
+            sel!(onRestoreMasterFileWorkspace:),
+            sel!(onRestoreLibraryWorkspace:),
+            sel!(onRestoreWorkspace:),
         );
-        self.status_item.setMenu(Some(&menu));
-        self.menu = menu;
+        rebuild_restore_menu(
+            self.mtm,
+            &self.menu_handler,
+            &self.restore_space_menu,
+            &files,
+            sel!(onRestoreMasterFileSpace:),
+            sel!(onRestoreLibrarySpace:),
+            sel!(onRestoreSpace:),
+        );
+    }
 
-        let mode = settings.mode;
-        let style = settings.display_style;
-        let label_for = |workspace: &WorkspaceData| match settings.active_label {
-            ActiveWorkspaceLabel::Index => format!("{}", workspace.index + 1),
-            ActiveWorkspaceLabel::Name => {
-                if workspace.name.is_empty() {
-                    format!("{}", workspace.index + 1)
-                } else {
-                    workspace.name.clone()
-                }
-            }
+    pub fn update_status_icon(
+        &mut self,
+        workspaces: &[RuntimeWorkspaceData],
+        settings: &MenuBarSettings,
+    ) {
+        let show_windows = matches!(settings.display_style, WorkspaceDisplayStyle::Layout);
+        let label_for = |workspace: &RuntimeWorkspaceData| match settings.active_label {
+            ActiveWorkspaceLabel::Index => (workspace.index + 1).to_string(),
+            ActiveWorkspaceLabel::Name if !workspace.name.is_empty() => workspace.name.clone(),
+            ActiveWorkspaceLabel::Name => (workspace.index + 1).to_string(),
+        };
+        let make_input = |workspace| WorkspaceRenderInput {
+            workspace,
+            label: if show_windows {
+                String::new()
+            } else {
+                label_for(workspace)
+            },
+            show_windows,
         };
 
-        let render_inputs = match (mode, style) {
-            (MenuBarDisplayMode::All, WorkspaceDisplayStyle::Layout) => {
-                let filtered = if settings.show_empty {
-                    workspaces.to_vec()
-                } else {
-                    workspaces
-                        .iter()
-                        .cloned()
-                        .filter(|w| w.window_count > 0 || w.is_active)
-                        .collect::<Vec<_>>()
-                };
-                filtered
-                    .into_iter()
-                    .map(|ws| WorkspaceRenderInput {
-                        workspace: ws,
-                        label: String::new(),
-                        show_windows: true,
-                    })
-                    .collect()
-            }
-            (MenuBarDisplayMode::All, WorkspaceDisplayStyle::Label) => workspaces
+        let render_inputs: Vec<_> = match settings.mode {
+            MenuBarDisplayMode::All => workspaces
                 .iter()
-                .cloned()
-                .filter(|w| settings.show_empty || w.window_count > 0 || w.is_active)
-                .map(|ws| {
-                    let mut clone = ws.clone();
-                    clone.windows.clear();
-                    clone.window_count = 0;
-                    WorkspaceRenderInput {
-                        workspace: clone,
-                        label: label_for(&ws),
-                        show_windows: false,
-                    }
+                .filter(|workspace| {
+                    settings.show_empty || workspace.window_count > 0 || workspace.is_active
                 })
+                .map(|workspace| make_input(workspace))
                 .collect(),
-            (MenuBarDisplayMode::Active, WorkspaceDisplayStyle::Layout) => workspaces
+            MenuBarDisplayMode::Active => workspaces
                 .iter()
-                .cloned()
-                .find(|w| w.is_active)
-                .map(|ws| {
-                    vec![WorkspaceRenderInput {
-                        workspace: ws,
-                        label: String::new(),
-                        show_windows: true,
-                    }]
-                })
-                .unwrap_or_default(),
-            (MenuBarDisplayMode::Active, WorkspaceDisplayStyle::Label) => workspaces
-                .iter()
-                .cloned()
-                .find(|w| w.is_active)
-                .map(|ws| {
-                    let mut clone = ws.clone();
-                    clone.windows.clear();
-                    clone.window_count = 0;
-                    vec![WorkspaceRenderInput {
-                        workspace: clone,
-                        label: label_for(&ws),
-                        show_windows: false,
-                    }]
-                })
+                .find(|workspace| workspace.is_active)
+                .map(|workspace| vec![make_input(workspace)])
                 .unwrap_or_default(),
         };
 
@@ -228,37 +323,34 @@ impl MenuIcon {
         }
 
         let layout = {
-            let view_ivars = self.view.ivars();
-            let active_attrs = view_ivars.active_text_attrs.as_ref();
-            let inactive_attrs = view_ivars.inactive_text_attrs.as_ref();
-            build_layout(&render_inputs, active_attrs, inactive_attrs)
+            let ivars = self.view.ivars();
+            build_layout(
+                &render_inputs,
+                ivars.active_text_attrs.as_ref(),
+                ivars.inactive_text_attrs.as_ref(),
+            )
         };
-        if layout.workspaces.is_empty() {
-            self.status_item.setVisible(false);
-            self.prev_width = 0.0;
-            return;
-        }
-
-        let size = NSSize::new(layout.total_width, layout.total_height);
+        let size = NSSize::new(layout.total_width, CELL_HEIGHT);
         self.view.set_layout(layout);
-
-        self.status_item.setLength(size.width);
         self.status_item.setVisible(true);
 
-        if let Some(btn) = self.status_item.button(self.mtm) {
-            if self.prev_width != size.width {
-                self.prev_width = size.width;
-                btn.setNeedsLayout(true);
-            }
-
-            self.view.setFrameSize(size);
-            let btn_bounds = btn.bounds();
-            let x = (btn_bounds.size.width - size.width) / 2.0;
-            let y = (btn_bounds.size.height - size.height) / 2.0;
-            self.view.setFrameOrigin(CGPoint::new(x, y));
+        let width_changed = self.prev_width != size.width;
+        if width_changed {
+            self.prev_width = size.width;
+            self.status_item.setLength(size.width);
         }
 
-        self.view.setNeedsDisplay(true);
+        if let Some(button) = self.status_item.button(self.mtm) {
+            if width_changed {
+                button.setNeedsLayout(true);
+            }
+            self.view.setFrameSize(size);
+            let bounds = button.bounds();
+            self.view.setFrameOrigin(CGPoint::new(
+                (bounds.size.width - size.width) / 2.0,
+                (bounds.size.height - size.height) / 2.0,
+            ));
+        }
     }
 }
 
@@ -274,7 +366,6 @@ impl Drop for MenuIcon {
 #[derive(Default)]
 struct MenuIconLayout {
     total_width: f64,
-    total_height: f64,
     workspaces: Vec<WorkspaceRenderData>,
 }
 
@@ -283,11 +374,10 @@ struct WorkspaceRenderData {
     fill_alpha: f64,
     windows: Vec<CGRect>,
     label_line: Option<CachedTextLine>,
-    show_windows: bool,
 }
 
-struct WorkspaceRenderInput {
-    workspace: WorkspaceData,
+struct WorkspaceRenderInput<'a> {
+    workspace: &'a RuntimeWorkspaceData,
     label: String,
     show_windows: bool,
 }
@@ -320,7 +410,7 @@ fn parse_layout_mode(layout_mode: &str) -> Option<LayoutMode> {
     }
 }
 
-fn layout_title(mode: LayoutMode) -> &'static str {
+fn layout_title(mode: &LayoutMode) -> &'static str {
     match mode {
         LayoutMode::Traditional => "Traditional",
         LayoutMode::Bsp => "BSP",
@@ -330,59 +420,114 @@ fn layout_title(mode: LayoutMode) -> &'static str {
     }
 }
 
+fn make_menu(mtm: MainThreadMarker, title: &str) -> Retained<NSMenu> {
+    let title = NSString::from_str(title);
+    unsafe { msg_send![NSMenu::alloc(mtm), initWithTitle: &*title] }
+}
+
 fn make_menu_item(
     mtm: MainThreadMarker,
     title: &str,
     action: Option<objc2::runtime::Sel>,
     target: Option<&MenuActionHandler>,
-    checked: Option<bool>,
-    key_equivalent: Option<&Hotkey>,
-    tag: Option<isize>,
 ) -> Retained<NSMenuItem> {
-    let ns_title = NSString::from_str(title);
-    let key_equivalent_empty = NSString::from_str("");
+    let title = NSString::from_str(title);
+    let empty = NSString::from_str("");
     let item: Retained<NSMenuItem> = unsafe {
-        msg_send![NSMenuItem::alloc(mtm), initWithTitle: &*ns_title, action: action, keyEquivalent: &*key_equivalent_empty]
+        msg_send![NSMenuItem::alloc(mtm), initWithTitle: &*title, action: action, keyEquivalent: &*empty]
     };
     if let Some(target) = target {
-        unsafe {
-            item.setTarget(Some(target));
-        }
+        unsafe { item.setTarget(Some(target)) };
     }
-    if let Some(checked) = checked {
-        item.setState(if checked {
-            NSControlStateValueOn
-        } else {
-            NSControlStateValueOff
-        });
-    }
-
-    if let Some((key, modifiers)) = key_equivalent.and_then(menu_hotkey_to_key_equivalent) {
-        let key = NSString::from_str(key);
-        item.setKeyEquivalent(&key);
-        item.setKeyEquivalentModifierMask(modifiers);
-    }
-    if let Some(tag) = tag {
-        item.setTag(tag);
-    }
-
     item
 }
 
-fn add_separator(menu: &NSMenu) {
-    let separator: Retained<NSMenuItem> = unsafe { msg_send![NSMenuItem::class(), separatorItem] };
-    menu.addItem(&separator);
+fn add_action_item(
+    menu: &NSMenu,
+    mtm: MainThreadMarker,
+    handler: &MenuActionHandler,
+    title: &str,
+    action: objc2::runtime::Sel,
+) -> Retained<NSMenuItem> {
+    let item = make_menu_item(mtm, title, Some(action), Some(handler));
+    menu.addItem(&item);
+    item
+}
+
+fn add_submenu(
+    menu: &NSMenu,
+    mtm: MainThreadMarker,
+    title: &str,
+) -> (Retained<NSMenuItem>, Retained<NSMenu>) {
+    let item = make_menu_item(mtm, title, None, None);
+    let submenu = make_menu(mtm, title);
+    item.setSubmenu(Some(&submenu));
+    menu.addItem(&item);
+    (item, submenu)
+}
+
+fn add_separator(menu: &NSMenu) { menu.addItem(&menu_separator()); }
+
+fn menu_separator() -> Retained<NSMenuItem> {
+    unsafe { msg_send![NSMenuItem::class(), separatorItem] }
+}
+
+fn set_menu_item_checked(item: &NSMenuItem, checked: bool) {
+    item.setState(if checked {
+        NSControlStateValueOn
+    } else {
+        NSControlStateValueOff
+    });
+}
+
+fn set_menu_item_hotkey(item: &NSMenuItem, hotkey: Option<&Hotkey>) {
+    let (key, modifiers) = hotkey
+        .and_then(menu_hotkey_to_key_equivalent)
+        .unwrap_or(("", NSEventModifierFlags::empty()));
+    item.setKeyEquivalent(&NSString::from_str(key));
+    item.setKeyEquivalentModifierMask(modifiers);
+}
+
+fn workspace_menu_title(workspace: &RuntimeWorkspaceData) -> String {
+    if workspace.name.is_empty() {
+        format!("Workspace {}", workspace.index + 1)
+    } else {
+        format!("{} ({})", workspace.name, workspace.index + 1)
+    }
+}
+
+fn rebuild_restore_menu(
+    mtm: MainThreadMarker,
+    handler: &MenuActionHandler,
+    menu: &NSMenu,
+    files: &[(String, PathBuf)],
+    master_action: objc2::runtime::Sel,
+    library_action: objc2::runtime::Sel,
+    picker_action: objc2::runtime::Sel,
+) {
+    menu.removeAllItems();
+    add_action_item(menu, mtm, handler, "Master Layout", master_action);
+
+    if !files.is_empty() {
+        add_separator(menu);
+        for (index, (name, _)) in files.iter().enumerate() {
+            let item = add_action_item(menu, mtm, handler, name, library_action);
+            item.setTag(index as isize);
+        }
+    }
+
+    add_separator(menu);
+    add_action_item(menu, mtm, handler, "Choose Layout File…", picker_action);
 }
 
 fn layout_file_title(path: &Path) -> Option<String> {
-    let file_name = path.file_name()?.to_str()?;
-    if file_name.starts_with('.') {
-        return None;
-    }
-    path.file_stem()?.to_str().map(str::to_owned)
+    let stem = path.file_stem()?.to_str()?;
+    (!stem.starts_with('.')).then(|| stem.to_owned())
 }
 
 fn layout_library_files_in(directory: &Path) -> Vec<(String, PathBuf)> {
+    #[cfg(test)]
+    LAYOUT_LIBRARY_SCANS.with(|scans| scans.set(scans.get() + 1));
     let Ok(entries) = std::fs::read_dir(directory) else {
         return Vec::new();
     };
@@ -406,24 +551,48 @@ fn layout_library_files_in(directory: &Path) -> Vec<(String, PathBuf)> {
     layouts
 }
 
-fn build_status_menu(
-    mtm: MainThreadMarker,
-    handler: &MenuActionHandler,
-    active_layout: Option<LayoutMode>,
-    _active_space: SpaceId,
-    active_space_is_activated: bool,
-    workspaces: &[WorkspaceData],
-    shortcuts: &MenuShortcuts,
-    layout_folder: &Path,
-) -> Retained<NSMenu> {
-    let title = NSString::from_str("Rift");
-    let menu: Retained<NSMenu> = unsafe { msg_send![NSMenu::alloc(mtm), initWithTitle: &*title] };
+struct BuiltStatusMenu {
+    menu: Retained<NSMenu>,
+    layout_items: Vec<(LayoutMode, Retained<NSMenuItem>)>,
+    workspace_item: Retained<NSMenuItem>,
+    workspace_submenu: Retained<NSMenu>,
+    next_workspace_item: Retained<NSMenuItem>,
+    prev_workspace_item: Retained<NSMenuItem>,
+    tiling_item: Retained<NSMenuItem>,
+    reload_item: Retained<NSMenuItem>,
+    quit_item: Retained<NSMenuItem>,
+    restore_workspace_menu: Retained<NSMenu>,
+    restore_space_menu: Retained<NSMenu>,
+}
 
-    let layout_item = make_menu_item(mtm, "Layout", None, None, None, None, None);
-    let layout_submenu_title = NSString::from_str("Layout");
-    let layout_submenu: Retained<NSMenu> =
-        unsafe { msg_send![NSMenu::alloc(mtm), initWithTitle: &*layout_submenu_title] };
+fn build_static_menu(mtm: MainThreadMarker, handler: &MenuActionHandler) -> BuiltStatusMenu {
+    let menu = make_menu(mtm, "Rift");
 
+    let tiling_item =
+        add_action_item(&menu, mtm, handler, "Tiling", sel!(onToggleSpaceActivation:));
+    set_menu_item_checked(&tiling_item, false);
+    add_separator(&menu);
+
+    let (workspace_item, workspace_submenu) = add_submenu(&menu, mtm, "Workspace");
+    let next_workspace_item = add_action_item(
+        &workspace_submenu,
+        mtm,
+        handler,
+        "Next Workspace",
+        sel!(onNextWorkspace:),
+    );
+    let prev_workspace_item = add_action_item(
+        &workspace_submenu,
+        mtm,
+        handler,
+        "Previous Workspace",
+        sel!(onPrevWorkspace:),
+    );
+    add_separator(&workspace_submenu);
+    workspace_item.setEnabled(false);
+
+    let (_, layout_submenu) = add_submenu(&menu, mtm, "Layout");
+    let mut layout_items = Vec::with_capacity(5);
     for mode in [
         LayoutMode::Traditional,
         LayoutMode::Bsp,
@@ -438,247 +607,61 @@ fn build_status_menu(
             LayoutMode::MasterStack => sel!(onSetLayoutMasterStack:),
             LayoutMode::Scrolling => sel!(onSetLayoutScrolling:),
         };
-        let item = make_menu_item(
-            mtm,
-            layout_title(mode),
-            Some(action),
-            Some(handler),
-            Some(active_layout == Some(mode)),
-            None,
-            None,
-        );
-        layout_submenu.addItem(&item);
+        let item = add_action_item(&layout_submenu, mtm, handler, layout_title(&mode), action);
+        set_menu_item_checked(&item, false);
+        layout_items.push((mode, item));
     }
-    layout_item.setSubmenu(Some(&layout_submenu));
-    menu.addItem(&layout_item);
 
-    let workspace_item = make_menu_item(mtm, "Workspaces", None, None, None, None, None);
-    let ws_submenu_title = NSString::from_str("Workspace");
-    let ws_submenu: Retained<NSMenu> =
-        unsafe { msg_send![NSMenu::alloc(mtm), initWithTitle: &*ws_submenu_title] };
-
-    ws_submenu.addItem(&make_menu_item(
+    let (_, saved_layouts_menu) = add_submenu(&menu, mtm, "Saved Layouts");
+    add_action_item(
+        &saved_layouts_menu,
         mtm,
-        "Next Workspace",
-        Some(sel!(onNextWorkspace:)),
-        Some(handler),
-        None,
-        shortcuts.next_workspace.as_ref(),
-        None,
-    ));
-    ws_submenu.addItem(&make_menu_item(
+        handler,
+        "Save Layout As…",
+        sel!(onSaveLayout:),
+    );
+    add_action_item(
+        &saved_layouts_menu,
         mtm,
-        "Previous Workspace",
-        Some(sel!(onPrevWorkspace:)),
-        Some(handler),
-        None,
-        shortcuts.prev_workspace.as_ref(),
-        None,
-    ));
-    add_separator(&ws_submenu);
+        handler,
+        "Update Master Layout",
+        sel!(onSaveMasterFile:),
+    );
+    add_separator(&saved_layouts_menu);
+    let (_, restore_workspace_menu) = add_submenu(&saved_layouts_menu, mtm, "Restore Workspace");
+    let (_, restore_space_menu) = add_submenu(&saved_layouts_menu, mtm, "Restore Space");
 
-    for ws in workspaces {
-        let ws_label = if ws.name.is_empty() {
-            format!("Workspace {}", ws.index + 1)
-        } else {
-            format!("{} ({})", ws.name, ws.index + 1)
-        };
-        let ws_shortcut = shortcuts
-            .switch_workspace_by_index
-            .get(&ws.index)
-            .or_else(|| shortcuts.switch_workspace_by_name.get(&ws.name));
-        let ws_item = make_menu_item(
-            mtm,
-            &ws_label,
-            Some(sel!(onSwitchWorkspace:)),
-            Some(handler),
-            Some(ws.is_active),
-            ws_shortcut,
-            Some(ws.index as isize),
-        );
-        ws_submenu.addItem(&ws_item);
-    }
-    if workspaces.is_empty() {
-        workspace_item.setEnabled(false);
-    } else {
-        workspace_item.setSubmenu(Some(&ws_submenu));
-    }
-    menu.addItem(&workspace_item);
+    add_separator(&menu);
+    let reload_item = add_action_item(&menu, mtm, handler, "Reload Config", sel!(onReloadConfig:));
+    add_action_item(&menu, mtm, handler, "Settings…", sel!(onOpenConfig:));
 
-    let layouts_item = make_menu_item(mtm, "Layout Files", None, None, None, None, None);
-    let layouts_title = NSString::from_str("Layout Files");
-    let layouts_submenu: Retained<NSMenu> =
-        unsafe { msg_send![NSMenu::alloc(mtm), initWithTitle: &*layouts_title] };
-    let library_files = layout_library_files_in(layout_folder);
-    handler.set_layout_folder(layout_folder.to_path_buf());
-    handler.set_layout_files(library_files.iter().map(|(_, path)| path.clone()).collect());
-
-    let save_item = make_menu_item(mtm, "Save Layout", None, None, None, None, None);
-    let save_title = NSString::from_str("Save Layout");
-    let save_submenu: Retained<NSMenu> =
-        unsafe { msg_send![NSMenu::alloc(mtm), initWithTitle: &*save_title] };
+    add_separator(&menu);
+    let (_, help_menu) = add_submenu(&menu, mtm, "Help");
     for (title, action) in [
-        ("Update Master File", sel!(onSaveMasterFile:)),
-        ("Save Layout File…", sel!(onSaveLayout:)),
+        ("Documentation", sel!(onOpenDocumentation:)),
+        ("GitHub", sel!(onOpenGitHub:)),
+        ("Matrix", sel!(onOpenMatrix:)),
     ] {
-        save_submenu.addItem(&make_menu_item(
-            mtm,
-            title,
-            Some(action),
-            Some(handler),
-            None,
-            None,
-            None,
-        ));
+        add_action_item(&help_menu, mtm, handler, title, action);
     }
-    save_item.setSubmenu(Some(&save_submenu));
-    layouts_submenu.addItem(&save_item);
-    add_separator(&layouts_submenu);
+    add_action_item(&menu, mtm, handler, "Support Rift…", sel!(onOpenSponsor:));
 
-    for (title, master_action, picker_action, library_action) in [
-        (
-            "Restore to Workspace",
-            sel!(onRestoreMasterFileWorkspace:),
-            sel!(onRestoreWorkspace:),
-            sel!(onRestoreLibraryWorkspace:),
-        ),
-        (
-            "Restore to Space",
-            sel!(onRestoreMasterFileSpace:),
-            sel!(onRestoreSpace:),
-            sel!(onRestoreLibrarySpace:),
-        ),
-    ] {
-        let restore_item = make_menu_item(mtm, title, None, None, None, None, None);
-        let restore_title = NSString::from_str(title);
-        let restore_submenu: Retained<NSMenu> =
-            unsafe { msg_send![NSMenu::alloc(mtm), initWithTitle: &*restore_title] };
-        for (source, action) in [
-            ("Master File", master_action),
-            ("Choose File…", picker_action),
-        ] {
-            restore_submenu.addItem(&make_menu_item(
-                mtm,
-                source,
-                Some(action),
-                Some(handler),
-                None,
-                None,
-                None,
-            ));
-        }
-        if !library_files.is_empty() {
-            add_separator(&restore_submenu);
-            let library_heading =
-                make_menu_item(mtm, "Saved Layouts", None, None, None, None, None);
-            library_heading.setEnabled(false);
-            restore_submenu.addItem(&library_heading);
-            for (index, (name, _)) in library_files.iter().enumerate() {
-                restore_submenu.addItem(&make_menu_item(
-                    mtm,
-                    name,
-                    Some(library_action),
-                    Some(handler),
-                    None,
-                    None,
-                    Some(index as isize),
-                ));
-            }
-        }
-        restore_item.setSubmenu(Some(&restore_submenu));
-        layouts_submenu.addItem(&restore_item);
+    add_separator(&menu);
+    let quit_item = add_action_item(&menu, mtm, handler, "Quit Rift", sel!(onQuitRift:));
+
+    BuiltStatusMenu {
+        menu,
+        layout_items,
+        workspace_item,
+        workspace_submenu,
+        next_workspace_item,
+        prev_workspace_item,
+        tiling_item,
+        reload_item,
+        quit_item,
+        restore_workspace_menu,
+        restore_space_menu,
     }
-    layouts_item.setSubmenu(Some(&layouts_submenu));
-    menu.addItem(&layouts_item);
-
-    add_separator(&menu);
-    menu.addItem(&make_menu_item(
-        mtm,
-        "Enable Tiling",
-        Some(sel!(onToggleSpaceActivation:)),
-        Some(handler),
-        Some(active_space_is_activated),
-        shortcuts.toggle_space_activation.as_ref(),
-        None,
-    ));
-
-    add_separator(&menu);
-    menu.addItem(&make_menu_item(
-        mtm,
-        "Settings…",
-        Some(sel!(onOpenConfig:)),
-        Some(handler),
-        None,
-        None,
-        None,
-    ));
-    menu.addItem(&make_menu_item(
-        mtm,
-        "Reload Config",
-        Some(sel!(onReloadConfig:)),
-        Some(handler),
-        None,
-        shortcuts.reload_config.as_ref(),
-        None,
-    ));
-
-    let help_item = make_menu_item(mtm, "Help / Documentation", None, None, None, None, None);
-    let help_submenu_title = NSString::from_str("Help / Documentation");
-    let help_submenu: Retained<NSMenu> =
-        unsafe { msg_send![NSMenu::alloc(mtm), initWithTitle: &*help_submenu_title] };
-    help_submenu.addItem(&make_menu_item(
-        mtm,
-        "Documentation",
-        Some(sel!(onOpenDocumentation:)),
-        Some(handler),
-        None,
-        None,
-        None,
-    ));
-    help_submenu.addItem(&make_menu_item(
-        mtm,
-        "GitHub",
-        Some(sel!(onOpenGitHub:)),
-        Some(handler),
-        None,
-        None,
-        None,
-    ));
-    help_submenu.addItem(&make_menu_item(
-        mtm,
-        "Matrix",
-        Some(sel!(onOpenMatrix:)),
-        Some(handler),
-        None,
-        None,
-        None,
-    ));
-    add_separator(&help_submenu);
-    help_submenu.addItem(&make_menu_item(
-        mtm,
-        "Sponsor Rift",
-        Some(sel!(onOpenSponsor:)),
-        Some(handler),
-        None,
-        None,
-        None,
-    ));
-
-    help_item.setSubmenu(Some(&help_submenu));
-    menu.addItem(&help_item);
-
-    add_separator(&menu);
-    menu.addItem(&make_menu_item(
-        mtm,
-        "Quit Rift",
-        Some(sel!(onQuitRift:)),
-        Some(handler),
-        None,
-        shortcuts.quit_rift.as_ref(),
-        None,
-    ));
-
-    menu
 }
 
 #[derive(Default)]
@@ -1089,6 +1072,24 @@ define_class!(
 mod layout_library_tests {
     use super::*;
 
+    fn workspace(
+        id: &str,
+        index: usize,
+        name: &str,
+        active: bool,
+        layout: &str,
+    ) -> RuntimeWorkspaceData {
+        RuntimeWorkspaceData {
+            id: id.to_owned(),
+            index,
+            name: name.to_owned(),
+            layout_mode: layout.to_owned(),
+            is_active: active,
+            window_count: 0,
+            windows: Vec::new(),
+        }
+    }
+
     #[test]
     fn layout_library_only_lists_visible_ron_files_in_name_order() {
         let directory = tempfile::tempdir().unwrap();
@@ -1102,6 +1103,60 @@ mod layout_library_tests {
         let names = layouts.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>();
 
         assert_eq!(names, ["gaming", "Work"]);
+    }
+
+    #[test]
+    fn workspace_state_changes_do_not_invalidate_topology_or_scan_library() {
+        let before = vec![
+            workspace("one", 0, "main", true, "bsp"),
+            workspace("two", 1, "web", false, "stack"),
+        ];
+        let after_switch = vec![
+            workspace("one", 0, "main", false, "bsp"),
+            workspace("two", 1, "web", true, "master_stack"),
+        ];
+        let scans_before = LAYOUT_LIBRARY_SCANS.with(Cell::get);
+
+        assert_eq!(workspace_topology(&before), workspace_topology(&after_switch));
+        assert_eq!(LAYOUT_LIBRARY_SCANS.with(Cell::get), scans_before);
+    }
+
+    #[test]
+    fn workspace_topology_changes_for_create_rename_delete_and_reorder() {
+        let base = vec![
+            workspace("one", 0, "main", true, "bsp"),
+            workspace("two", 1, "web", false, "stack"),
+        ];
+        let created = vec![
+            workspace("one", 0, "main", true, "bsp"),
+            workspace("two", 1, "web", false, "stack"),
+            workspace("three", 2, "chat", false, "bsp"),
+        ];
+        let renamed = vec![
+            workspace("one", 0, "primary", true, "bsp"),
+            workspace("two", 1, "web", false, "stack"),
+        ];
+        let deleted = vec![workspace("one", 0, "main", true, "bsp")];
+        let reordered = vec![
+            workspace("two", 0, "web", false, "stack"),
+            workspace("one", 1, "main", true, "bsp"),
+        ];
+        let topology = workspace_topology(&base);
+
+        for changed in [&created, &renamed, &deleted, &reordered] {
+            assert_ne!(topology, workspace_topology(changed));
+        }
+    }
+
+    #[test]
+    fn refreshing_layout_library_sees_files_created_after_first_scan() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(layout_library_files_in(directory.path()).is_empty());
+
+        std::fs::write(directory.path().join("new-layout.ron"), "").unwrap();
+
+        let layouts = layout_library_files_in(directory.path());
+        assert_eq!(layouts[0].0, "new-layout");
     }
 }
 
@@ -1176,18 +1231,16 @@ impl MenuIconView {
 }
 
 fn build_layout(
-    inputs: &[WorkspaceRenderInput],
+    inputs: &[WorkspaceRenderInput<'_>],
     active_attrs: &NSDictionary<NSAttributedStringKey, AnyObject>,
     inactive_attrs: &NSDictionary<NSAttributedStringKey, AnyObject>,
 ) -> MenuIconLayout {
     let count = inputs.len();
-    let total_width =
-        (CELL_WIDTH * count as f64) + (CELL_SPACING * (count.saturating_sub(1) as f64));
-    let total_height = CELL_HEIGHT;
+    let total_width = (CELL_WIDTH * count as f64) + (CELL_SPACING * count.saturating_sub(1) as f64);
 
     let mut workspaces = Vec::with_capacity(count);
     for (i, input) in inputs.iter().enumerate() {
-        let workspace = &input.workspace;
+        let workspace = input.workspace;
         let bg_x = i as f64 * (CELL_WIDTH + CELL_SPACING);
         let bg_y = 0.0;
         let bg_rect = CGRect::new(CGPoint::new(bg_x, bg_y), CGSize::new(CELL_WIDTH, CELL_HEIGHT));
@@ -1246,15 +1299,10 @@ fn build_layout(
             fill_alpha,
             windows,
             label_line,
-            show_windows: input.show_windows,
         });
     }
 
-    MenuIconLayout {
-        total_width,
-        total_height,
-        workspaces,
-    }
+    MenuIconLayout { total_width, workspaces }
 }
 
 fn add_rounded_rect(ctx: &CGContext, x: f64, y: f64, w: f64, h: f64, r: f64) {
@@ -1292,7 +1340,7 @@ define_class!(
                 CGContext::save_g_state(Some(cg));
                 CGContext::clear_rect(Some(cg), bounds);
 
-                let y_offset = (bounds.size.height - layout.total_height) / 2.0;
+                let y_offset = (bounds.size.height - CELL_HEIGHT) / 2.0;
 
                 for workspace in layout.workspaces.iter() {
                     let rect = workspace.bg_rect;
@@ -1329,34 +1377,32 @@ define_class!(
                     CGContext::set_line_width(Some(cg), BORDER_WIDTH);
                     CGContext::stroke_path(Some(cg));
 
-                    if workspace.show_windows {
-                        for window in workspace.windows.iter() {
-                            add_rounded_rect(
-                                cg,
-                                window.origin.x,
-                                window.origin.y + y_offset,
-                                window.size.width,
-                                window.size.height,
-                                1.5,
-                            );
-                            CGContext::set_rgb_fill_color(Some(cg), 1.0, 1.0, 1.0, 1.0);
-                            CGContext::fill_path(Some(cg));
+                    for window in &workspace.windows {
+                        add_rounded_rect(
+                            cg,
+                            window.origin.x,
+                            window.origin.y + y_offset,
+                            window.size.width,
+                            window.size.height,
+                            1.5,
+                        );
+                        CGContext::set_rgb_fill_color(Some(cg), 1.0, 1.0, 1.0, 1.0);
+                        CGContext::fill_path(Some(cg));
 
-                            CGContext::save_g_state(Some(cg));
-                            CGContext::set_blend_mode(Some(cg), CGBlendMode::DestinationOut);
-                            CGContext::set_rgb_stroke_color(Some(cg), 1.0, 1.0, 1.0, 1.0);
-                            CGContext::set_line_width(Some(cg), 1.5);
-                            add_rounded_rect(
-                                cg,
-                                window.origin.x,
-                                window.origin.y,
-                                window.size.width,
-                                window.size.height,
-                                1.5,
-                            );
-                            CGContext::stroke_path(Some(cg));
-                            CGContext::restore_g_state(Some(cg));
-                        }
+                        CGContext::save_g_state(Some(cg));
+                        CGContext::set_blend_mode(Some(cg), CGBlendMode::DestinationOut);
+                        CGContext::set_rgb_stroke_color(Some(cg), 1.0, 1.0, 1.0, 1.0);
+                        CGContext::set_line_width(Some(cg), 1.5);
+                        add_rounded_rect(
+                            cg,
+                            window.origin.x,
+                            window.origin.y + y_offset,
+                            window.size.width,
+                            window.size.height,
+                            1.5,
+                        );
+                        CGContext::stroke_path(Some(cg));
+                        CGContext::restore_g_state(Some(cg));
                     }
 
                     if let Some(label_line) = &workspace.label_line {

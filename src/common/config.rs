@@ -2,8 +2,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::bail;
+use regex::RegexBuilder;
+pub use rift_protocol::{AnimationEasing, ConfigCommand, LayoutMode, WorkspaceSelector};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use super::collections::HashMap;
 use crate::actor::wm_controller::WmCommand;
@@ -17,44 +18,6 @@ const DEPRECATED_MAP: &[(&str, &str)] = &[
     ("unstack_windows", "toggle_stack"),
     ("toggle_tile_orientation", "toggle_orientation"),
 ];
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "snake_case")]
-pub enum ConfigCommand {
-    SetAnimate(bool),
-    SetAnimationDuration(f64),
-    SetAnimationFps(f64),
-    SetAnimationEasing(AnimationEasing),
-
-    SetMouseFollowsFocus(bool),
-    SetMouseHidesOnFocus(bool),
-    SetFocusFollowsMouse(bool),
-
-    SetStackOffset(f64),
-    SetOuterGaps {
-        top: f64,
-        left: f64,
-        bottom: f64,
-        right: f64,
-    },
-    SetInnerGaps {
-        horizontal: f64,
-        vertical: f64,
-    },
-
-    SetWorkspaceNames(Vec<String>),
-
-    /// Generic setter for arbitrary config paths using dot-separated keys.
-    /// Example: key = "settings.animate", value = true
-    Set {
-        key: String,
-        value: Value,
-    },
-
-    GetConfig,
-    SaveConfig,
-    ReloadConfig,
-}
 
 pub fn data_dir() -> PathBuf { dirs::home_dir().unwrap().join(".rift") }
 pub fn restore_file() -> PathBuf { data_dir().join("layout.ron") }
@@ -100,14 +63,7 @@ pub struct WorkspaceLayoutRule {
 
 // Allow specifying a workspace by numeric index or by name in the config.
 // This supports both `workspace = 2` and `workspace = "coding"` in app rules.
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Eq)]
-#[serde(untagged)]
-pub enum WorkspaceSelector {
-    Index(usize),
-    Name(String),
-}
-
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AppWorkspaceRule {
     /// Application bundle identifier (e.g., "com.apple.Terminal")
@@ -117,10 +73,19 @@ pub struct AppWorkspaceRule {
     /// Whether windows should be floating in this workspace
     #[serde(default)]
     pub floating: bool,
-    /// Whether Rift should manage matching windows (defaults to true). `false` makes the
-    /// window invisible to Rift (no tiling, floating, or assignments).
-    #[serde(default = "yes")]
-    pub manage: bool,
+    /// Initial normalized position for a floating window. `(0, 0)` is the top-left
+    /// and `(1, 1)` is the bottom-right of the available screen area.
+    pub position: Option<AppRulePosition>,
+    /// Preferred window size in logical pixels.
+    pub size: Option<AppRuleSize>,
+    /// Focus the window after applying this rule, switching virtual workspaces if needed.
+    #[serde(default)]
+    pub focus: bool,
+    /// An explicit management override. `false` makes the window invisible to Rift;
+    /// `true` overrides normal manageability heuristics for a visible window. When
+    /// omitted, the matching rule leaves Rift's normal manageability decision intact.
+    #[serde(default)]
+    pub manage: Option<bool>,
     /// Optional: Application name pattern (alternative to app_id)
     pub app_name: Option<String>,
     /// Optional: Regular expression to match window title (applies to window.title)
@@ -144,6 +109,20 @@ pub struct AppWorkspaceRule {
     /// non-empty string and will be compared against the accessibility subrole
     /// reported by the AX APIs for a window (exact string match).
     pub ax_subrole: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
+#[serde(deny_unknown_fields)]
+pub struct AppRulePosition {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
+#[serde(deny_unknown_fields)]
+pub struct AppRuleSize {
+    pub w: Option<f64>,
+    pub h: Option<f64>,
 }
 
 impl Default for VirtualWorkspaceSettings {
@@ -223,6 +202,42 @@ impl VirtualWorkspaceSettings {
                 }
             }
 
+            if let Some(position) = rule.position {
+                if !position.x.is_finite()
+                    || !position.y.is_finite()
+                    || !(0.0..=1.0).contains(&position.x)
+                    || !(0.0..=1.0).contains(&position.y)
+                {
+                    issues.push(format!(
+                        "App rule {} position x and y must be finite values between 0 and 1",
+                        index
+                    ));
+                }
+                if !rule.floating {
+                    issues.push(format!(
+                        "App rule {} specifies position, but position only applies when floating = true",
+                        index
+                    ));
+                }
+            }
+
+            if let Some(size) = rule.size {
+                if size.w.is_none() && size.h.is_none() {
+                    issues.push(format!(
+                        "App rule {} size must specify at least one of w or h",
+                        index
+                    ));
+                }
+                if size.w.is_some_and(|value| !value.is_finite() || value <= 0.0)
+                    || size.h.is_some_and(|value| !value.is_finite() || value <= 0.0)
+                {
+                    issues.push(format!(
+                        "App rule {} size dimensions must be finite positive values",
+                        index
+                    ));
+                }
+            }
+
             if let Some(ref app_id) = rule.app_id {
                 if !app_id.is_empty() && !app_id.contains('.') {
                     issues.push(format!(
@@ -250,9 +265,29 @@ impl VirtualWorkspaceSettings {
             if let Some(ref title_re) = rule.title_regex {
                 if title_re.is_empty() {
                     issues.push(format!("App rule {} has empty title_regex", index));
+                } else if let Err(error) =
+                    RegexBuilder::new(title_re).case_insensitive(true).build()
+                {
+                    issues.push(format!(
+                        "App rule {} has invalid title_regex '{}': {}",
+                        index, title_re, error
+                    ));
                 } else if !seen_title_regexes.insert(title_re) {
                     issues.push(format!("Duplicate title_regex '{}' in rule {}", title_re, index));
                 }
+            }
+
+            if rule.manage == Some(false)
+                && (rule.workspace.is_some()
+                    || rule.floating
+                    || rule.position.is_some()
+                    || rule.size.is_some()
+                    || rule.focus)
+            {
+                issues.push(format!(
+                    "App rule {} sets manage = false, so its workspace, floating, position, size, and focus effects are ignored",
+                    index
+                ));
             }
 
             if let Some(ref title_sub) = rule.title_substring {
@@ -426,35 +461,6 @@ pub struct Settings {
     pub hot_reload: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default, Copy)]
-#[serde(rename_all = "snake_case")]
-pub enum AnimationEasing {
-    #[default]
-    EaseInOut,
-    Linear,
-    EaseInSine,
-    EaseOutSine,
-    EaseInOutSine,
-    EaseInQuad,
-    EaseOutQuad,
-    EaseInOutQuad,
-    EaseInCubic,
-    EaseOutCubic,
-    EaseInOutCubic,
-    EaseInQuart,
-    EaseOutQuart,
-    EaseInOutQuart,
-    EaseInQuint,
-    EaseOutQuint,
-    EaseInOutQuint,
-    EaseInExpo,
-    EaseOutExpo,
-    EaseInOutExpo,
-    EaseInCirc,
-    EaseOutCirc,
-    EaseInOutCirc,
-}
-
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct UiSettings {
@@ -472,7 +478,8 @@ pub struct GestureSettings {
     /// Enable horizontal swipes to switch virtual workspaces
     #[serde(default = "no")]
     pub enabled: bool,
-    /// If true, consume low-level dock swipe events to prevent macOS from also handling them
+    /// If true, consume horizontal swipe events owned by Rift so macOS and the
+    /// foreground app do not also handle them.
     #[serde(default = "yes")]
     pub consume_dock_swipe: bool,
     /// Invert horizontal direction (swap next/prev)
@@ -658,12 +665,70 @@ impl StackLineSettings {
     pub fn thickness(&self) -> f64 { if self.enabled { self.thickness } else { 0.0 } }
 }
 
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowInsertionPoint {
+    /// Insert a new window immediately after the current selection.
+    #[default]
+    NextToSelection,
+    /// Append a new window at the end of the layout tree.
+    EndOfTree,
+}
+
+/// Options understood by every layout system.
+///
+/// These fields are flattened into both `[settings.layout]` and every
+/// per-layout table. A per-layout value overrides the layout-wide value.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BaseLayoutSettings {
+    /// Where newly managed windows are inserted.
+    #[serde(default)]
+    pub window_insertion_point: Option<WindowInsertionPoint>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct TraditionalLayoutSettings {
+    #[serde(flatten)]
+    pub base: BaseLayoutSettings,
+    /// Use Sway-style sibling normalization when inserting nodes. New nodes receive the
+    /// average sibling weight instead of splitting the selected node's share.
+    #[serde(default = "yes")]
+    pub equalize_nodes: bool,
+}
+
+impl Default for TraditionalLayoutSettings {
+    fn default() -> Self {
+        Self {
+            base: BaseLayoutSettings::default(),
+            equalize_nodes: true,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BspLayoutSettings {
+    #[serde(flatten)]
+    pub base: BaseLayoutSettings,
+}
+
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct LayoutSettings {
+    /// Settings inherited by every layout type unless overridden by its table.
+    #[serde(flatten)]
+    pub base: BaseLayoutSettings,
     /// Layout mode: "traditional", "bsp", "stack", "master_stack", or "scrolling"
     #[serde(default)]
     pub mode: LayoutMode,
+    /// Traditional layout configuration
+    #[serde(default)]
+    pub traditional: TraditionalLayoutSettings,
+    /// BSP layout configuration
+    #[serde(default)]
+    pub bsp: BspLayoutSettings,
     /// Stack system configuration
     #[serde(default)]
     pub stack: StackSettings,
@@ -678,38 +743,11 @@ pub struct LayoutSettings {
     pub scrolling: ScrollingLayoutSettings,
 }
 
-/// Layout mode enum
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum LayoutMode {
-    /// Traditional container-based tiling (i3/sway style)
-    #[default]
-    Traditional,
-    /// Binary space partitioning tiling
-    Bsp,
-    /// Dedicated stacked layout (single stack container)
-    Stack,
-    /// Master/stack layout (master area + stack area)
-    MasterStack,
-    /// Scrolling column layout (niri-style)
-    Scrolling,
-}
-
-impl ToString for LayoutMode {
-    fn to_string(&self) -> String {
-        match self {
-            LayoutMode::Traditional => "traditional".to_string(),
-            LayoutMode::Bsp => "bsp".to_string(),
-            LayoutMode::Stack => "stack".to_string(),
-            LayoutMode::MasterStack => "master_stack".to_string(),
-            LayoutMode::Scrolling => "scrolling".to_string(),
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ScrollingLayoutSettings {
+    #[serde(flatten)]
+    pub base: BaseLayoutSettings,
     /// Whether to animate window transitions in this layout.
     #[serde(default)]
     pub animate: Option<bool>,
@@ -738,6 +776,7 @@ pub struct ScrollingLayoutSettings {
 impl Default for ScrollingLayoutSettings {
     fn default() -> Self {
         Self {
+            base: BaseLayoutSettings::default(),
             animate: None,
             column_width_ratio: default_scrolling_column_width_ratio(),
             min_column_width_ratio: default_scrolling_min_column_width_ratio(),
@@ -779,6 +818,8 @@ pub enum ScrollingFocusNavigationStyle {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct MasterStackSettings {
+    #[serde(flatten)]
+    pub base: BaseLayoutSettings,
     /// Fraction of space reserved for the master area (0.05..0.95)
     #[serde(default = "default_master_stack_ratio")]
     pub master_ratio: f64,
@@ -859,6 +900,8 @@ pub enum StackDefaultOrientation {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct StackSettings {
+    #[serde(flatten)]
+    pub base: BaseLayoutSettings,
     /// Stack offset - how much each stacked window is offset (in pixels)
     /// With the enhanced stacking system, this creates meaningful visible edges
     /// for each window in the stack while the focused window remains fully visible.
@@ -935,6 +978,7 @@ pub struct GapOverride {
 impl Default for StackSettings {
     fn default() -> Self {
         Self {
+            base: BaseLayoutSettings::default(),
             stack_offset: default_stack_offset(),
             default_orientation: default_stack_orientation(),
         }
@@ -944,6 +988,7 @@ impl Default for StackSettings {
 impl Default for MasterStackSettings {
     fn default() -> Self {
         Self {
+            base: BaseLayoutSettings::default(),
             master_ratio: default_master_stack_ratio(),
             master_count: default_master_stack_count(),
             master_side: MasterStackSide::Left,
@@ -986,6 +1031,29 @@ impl Settings {
 }
 
 impl LayoutSettings {
+    pub fn base_for(&self, mode: LayoutMode) -> &BaseLayoutSettings {
+        match mode {
+            LayoutMode::Traditional => &self.traditional.base,
+            LayoutMode::Bsp => &self.bsp.base,
+            LayoutMode::Stack => &self.stack.base,
+            LayoutMode::MasterStack => &self.master_stack.base,
+            LayoutMode::Scrolling => &self.scrolling.base,
+        }
+    }
+
+    pub fn window_insertion_point_for(&self, mode: LayoutMode) -> WindowInsertionPoint {
+        self.base_for(mode)
+            .window_insertion_point
+            .or(self.base.window_insertion_point)
+            .unwrap_or_default()
+    }
+
+    pub fn resolved_base_for(&self, mode: LayoutMode) -> BaseLayoutSettings {
+        BaseLayoutSettings {
+            window_insertion_point: Some(self.window_insertion_point_for(mode)),
+        }
+    }
+
     pub fn validate(&self) -> Vec<String> {
         let mut issues = Vec::new();
 
@@ -1224,7 +1292,7 @@ fn default_workspace_names() -> Vec<String> {
 fn default_swipe_vertical_tolerance() -> f64 { 0.4 }
 fn default_swipe_fingers() -> usize { 3 }
 fn default_distance_pct() -> f64 { 0.08 }
-fn default_overscroll_threshold() -> f64 { 0.625 }
+fn default_overscroll_threshold() -> f64 { 0.15 }
 
 fn default_stack_line_spacing() -> f64 { 1.0 }
 fn default_stack_line_thickness() -> f64 { 20.0 }
@@ -1553,6 +1621,34 @@ mod tests {
     use crate::layout_engine::{LayoutCommand, ResizeOrientation};
 
     #[test]
+    fn layout_insertion_point_supports_global_default_and_per_mode_override() {
+        let settings: LayoutSettings = toml::from_str(
+            r#"
+                window_insertion_point = "end_of_tree"
+
+                [traditional]
+                window_insertion_point = "next_to_selection"
+                equalize_nodes = true
+
+                [scrolling]
+                animate = false
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            settings.window_insertion_point_for(LayoutMode::Traditional),
+            WindowInsertionPoint::NextToSelection
+        );
+        assert_eq!(
+            settings.window_insertion_point_for(LayoutMode::Bsp),
+            WindowInsertionPoint::EndOfTree
+        );
+        assert!(settings.traditional.equalize_nodes);
+        assert_eq!(settings.scrolling.animate, Some(false));
+    }
+
+    #[test]
     fn virtual_workspace_prevent_wrapping_defaults_to_false_and_accepts_suggested_alias() {
         let defaults: VirtualWorkspaceSettings = toml::from_str("").unwrap();
         assert!(!defaults.prevent_wrapping);
@@ -1560,6 +1656,88 @@ mod tests {
         let settings: VirtualWorkspaceSettings =
             toml::from_str("prevent_wrapping_around = true").unwrap();
         assert!(settings.prevent_wrapping);
+    }
+
+    #[test]
+    fn app_rules_parse_placement_size_and_focus() {
+        let settings: VirtualWorkspaceSettings = toml::from_str(
+            r#"
+                app_rules = [{
+                    app_id = "com.example.Tool",
+                    floating = true,
+                    position = { x = 0.4, y = 0.7 },
+                    size = { w = 640, h = 480 },
+                    focus = true
+                }]
+            "#,
+        )
+        .unwrap();
+
+        let rule = &settings.app_rules[0];
+        assert_eq!(rule.position, Some(AppRulePosition { x: 0.4, y: 0.7 }));
+        assert_eq!(rule.size, Some(AppRuleSize { w: Some(640.0), h: Some(480.0) }));
+        assert!(rule.focus);
+        assert!(settings.validate().is_empty());
+
+        let height_only: VirtualWorkspaceSettings = toml::from_str(
+            r#"
+                app_rules = [{
+                    app_id = "com.example.Panel",
+                    size = { h = 320 }
+                }]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            height_only.app_rules[0].size,
+            Some(AppRuleSize { w: None, h: Some(320.0) })
+        );
+        assert!(height_only.validate().is_empty());
+    }
+
+    #[test]
+    fn app_rule_geometry_validation_rejects_invalid_values() {
+        let mut settings = VirtualWorkspaceSettings::default();
+        settings.app_rules.push(AppWorkspaceRule {
+            app_id: Some("com.example.Tool".into()),
+            workspace: None,
+            floating: false,
+            position: Some(AppRulePosition { x: -0.1, y: 1.1 }),
+            size: Some(AppRuleSize {
+                w: Some(0.0),
+                h: Some(f64::NAN),
+            }),
+            focus: false,
+            manage: Some(true),
+            app_name: None,
+            title_regex: None,
+            title_substring: None,
+            ax_role: None,
+            ax_subrole: None,
+        });
+
+        let issues = settings.validate();
+        assert!(issues.iter().any(|issue| issue.contains("between 0 and 1")));
+        assert!(issues.iter().any(|issue| issue.contains("only applies")));
+        assert!(issues.iter().any(|issue| issue.contains("finite positive")));
+    }
+
+    #[test]
+    fn app_rule_validation_reports_invalid_regex_and_ignored_effects() {
+        let mut settings = VirtualWorkspaceSettings::default();
+        settings.app_rules.push(AppWorkspaceRule {
+            app_id: Some("com.example.Tool".into()),
+            workspace: Some(WorkspaceSelector::Index(1)),
+            floating: true,
+            focus: true,
+            manage: Some(false),
+            title_regex: Some("[".into()),
+            ..Default::default()
+        });
+
+        let issues = settings.validate();
+        assert!(issues.iter().any(|issue| issue.contains("invalid title_regex")));
+        assert!(issues.iter().any(|issue| issue.contains("effects are ignored")));
     }
 
     #[test]

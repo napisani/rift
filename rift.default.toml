@@ -22,6 +22,7 @@ animation_fps = 100.0
 # - focus_follows_mouse: moving the mouse into a window focuses it
 # - mouse_follows_focus: when focus changes, move the mouse to the focused window
 # - mouse_hides_on_focus: hide the mouse cursor after focusing a window
+# 	(this only works with mouse_follows_focus=true)
 focus_follows_mouse = true
 mouse_follows_focus = true
 mouse_hides_on_focus = true
@@ -40,13 +41,13 @@ auto_focus_blacklist = []
 #
 # Tip: You can subscribe to rift events and trigger your own scripts. The command will
 # receive environment variables with context:
-#   RIFT_EVENT_TYPE            # "workspace_changed" | "windows_changed" | "window_title_changed"
+#   RIFT_EVENT_TYPE            # "workspace_changed" | "windows_changed" | "window_title_changed" | "focused_window_changed"
 #   RIFT_WORKSPACE_ID          # workspace id
 #   RIFT_WORKSPACE_NAME        # workspace name
-#   RIFT_WORKSPACE_INDEX       # workspace index (window_title_changed only)
+#   RIFT_WORKSPACE_INDEX       # workspace index (window_title_changed and focused_window_changed)
 #   RIFT_WINDOW_COUNT          # number of windows (windows_changed only)
 #   RIFT_WINDOWS               # comma-separated window ids (windows_changed only)
-#   RIFT_WINDOW_ID             # window id (window_title_changed only)
+#   RIFT_WINDOW_ID             # window id (window_title_changed and focused_window_changed)
 #   RIFT_PREVIOUS_WINDOW_TITLE # previous title (window_title_changed only)
 #   RIFT_WINDOW_TITLE          # new title (window_title_changed only)
 #   RIFT_EVENT_JSON            # full JSON payload of the event
@@ -77,6 +78,18 @@ hot_reload = true
 # in the `workspace_rules` section below.
 # You can set different layouts per workspace using `workspace_rules`.
 mode = "traditional"
+
+# Where new windows are inserted by default for every layout:
+# - "next_to_selection": immediately after the selected window
+# - "end_of_tree": at the end of the layout
+# This can be overridden per-layout in each layouts respective section.
+window_insertion_point = "next_to_selection"
+
+# these settings only apply when layout mode == "traditional"
+[settings.layout.traditional]
+# Use Sway-style node normalization when adding windows. This gives a new node the
+# average sibling share while preserving the relative proportions of resized nodes.
+equalize_nodes = true
 
 # these settings only apply when layout mode == "master_stack"
 [settings.layout.master_stack]
@@ -211,8 +224,8 @@ fade_duration_ms = 180.0
 [settings.gestures]
 # Enable horizontal swipes to switch virtual workspaces
 enabled = false
-# If true, Rift consumes low-level dock swipe events for its trackpad gesture handlers
-# to prevent interference with rift's own swipe detection
+# If true, Rift consumes horizontal swipes handled by its trackpad gesture handlers
+# so macOS and the foreground app do not also handle them
 consume_dock_swipe = true
 # Invert horizontal direction (swap next/prev)
 invert_horizontal_swipe = false
@@ -294,7 +307,14 @@ workspace_names = [
 #   - workspace (integer, 0-based): target workspace index. If omitted or invalid, uses the active workspace.
 #     Alternatively, `workspace` may be a workspace name string to target by name.
 #   - floating (boolean): whether matched windows should float by default.
-#   - manage (boolean): whether Rift should manage the matching window. Set to false to ignore the window completely (default = true).
+#   - position ({ x, y }): initial normalized position for floating windows. Values range from
+#     0.0 (top/left) to 1.0 (bottom/right); the window remains freely movable afterward.
+#   - size ({ w, h }): initial size in logical pixels. Either dimension may be omitted. Floating
+#     windows are initially resized; tiled windows receive a one-time resize after insertion.
+#   - focus (boolean): focus the window after applying the rule, switching to its virtual workspace.
+#   - manage (boolean): optional explicit management override. Set to false to ignore the
+#     matching window completely, or true to override Rift/macOS manageability heuristics
+#     for a visible window. When omitted, normal heuristics apply. Minimized windows remain unmanaged.
 #
 # Matching behavior (summary):
 #   1. All rules that match a window are evaluated.
@@ -335,6 +355,11 @@ workspace_names = [
 #   - Match by app name substring and workspace:
 #       app_rules = [
 #         { app_name = "Calendar", workspace = 2, floating = true },
+#       ]
+#
+#   - Float, place, resize, and focus a window:
+#       app_rules = [
+#         { app_id = "com.example.X", floating = true, position = { x = 0.4, y = 0.7 }, size = { w = 640, h = 480 }, focus = true },
 #       ]
 #
 #   - Accessibility example: float dialog windows for a specific app:
@@ -440,6 +465,10 @@ comb1 = "Alt + Shift"
 "Alt + Ctrl + E" = "unjoin_windows"
 
 "Alt + Shift + Space" = "toggle_window_floating"
+# Optional floating placement (sizes are in logical points):
+# "Alt + Shift + Space" = { toggle_window_floating = { center = true } }
+# "Alt + Shift + Space" = { toggle_window_floating = { center = true, size = { w = 640, h = 480 } } }
+# "Alt + Shift + Space" = { toggle_window_floating = { center = true, size = "smart" } }
 "Alt + F" = "toggle_fullscreen"
 "Alt + Shift + F" = "toggle_fullscreen_within_gaps"
 "comb1 + Ctrl + Space" = "toggle_focus_floating" # briefly bring focus to floating window
